@@ -1,0 +1,29 @@
+name: Android library
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install SDK and native build tools
+        run: sdkmanager 'platforms;android-21' 'platforms;android-35' 'build-tools;34.0.0' 'cmake;3.22.1' 'ndk;25.1.8937393'
+      - name: Test core and compile generated fixes on host
+        run: ./scripts/test-generated-fixes.sh "$ANDROID_HOME/platforms/android-21/android.jar"
+      - name: Check Java APIs against Android 21
+        run: ./scripts/check-api21.sh "$ANDROID_HOME/platforms/android-21/android.jar"
+      - name: Assemble AAR
+        run: ./gradlew :analyzer:assembleRelease :analyzer:assembleAndroidTest :sample:assembleDebug
+      - name: Verify AAR contents
+        run: ./scripts/verify-aar.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shima-code-analyzer-aar
+          path: analyzer/build/outputs/aar/analyzer-release.aar

@@ -1,0 +1,33 @@
+plugins { id 'com.android.library' }
+
+android {
+    namespace 'com.shima.analyzer'
+    compileSdk 35
+    ndkVersion '25.1.8937393'
+
+    defaultConfig {
+        minSdk 21
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        ndk { abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64' }
+        consumerProguardFiles 'consumer-rules.pro'
+        externalNativeBuild {
+            cmake { arguments '-DANDROID_STL=none' }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// Test-only dependencies; they are not included in the SDK's runtime AAR.
+dependencies {
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}

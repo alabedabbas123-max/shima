@@ -1,0 +1,23 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.shima.analyzer.sample'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.shima.analyzer.sample'
+        minSdk 21
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// Deliberately consume the built AAR as an external app would, not the project module.
+// Model the producer on the file collection so transforms cannot run before the AAR exists.
+def analyzerAar = files("$rootDir/analyzer/build/outputs/aar/analyzer-release.aar")
+analyzerAar.builtBy(':analyzer:assembleRelease')
+dependencies { implementation analyzerAar }
