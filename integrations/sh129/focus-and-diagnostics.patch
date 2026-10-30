@@ -1,0 +1,417 @@
+diff --git a/app/src/main/java/almlk/AnalyzerBridge.java b/app/src/main/java/almlk/AnalyzerBridge.java
+--- a/app/src/main/java/almlk/AnalyzerBridge.java
++++ b/app/src/main/java/almlk/AnalyzerBridge.java
+@@ -139,13 +139,14 @@
+       return;
+     }
+     release();
++    // Keep ownership of the unavailable row too, so release/switch clears it.
++    fileName = tabFileName;
++    reference = next;
+     if (!nativeAvailable()) {
+       AnalyzerErrorUnit.putUnavailable(next, tabFileName, text(), new IllegalStateException(nativeReason));
+       notifyPublisher();
+       return;
+     }
+-    fileName = tabFileName;
+-    reference = next;
+     try {
+       handle = CodeAnalyzer.with(appContext)
+           .attachTo(new BridgeAdapter())
+@@ -452,6 +453,12 @@
+    */
+   private void notifyPublisher() {
+     if (publisher == null) return;
++    // A project-pass failure can reach here on the worker, but the publisher
++    // updates Android views and all focus/paint guards belong to the main thread.
++    if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
++      projectMain.post(this::notifyPublisher);
++      return;
++    }
+     if (publishOwner == Thread.currentThread()) {
+       publishAgain = true;
+       return;
+diff --git a/app/src/main/java/almlk/AnalyzerSignalQueue.java b/app/src/main/java/almlk/AnalyzerSignalQueue.java
+new file mode 100644
+--- /dev/null
++++ b/app/src/main/java/almlk/AnalyzerSignalQueue.java
+@@ -0,0 +1,72 @@
++package almlk;
++
++/**
++ * Coalesces editor signals onto an asynchronous main-thread poster. The latest
++ * editor wins, while any text edit in the batch still requests a project pass.
++ * All calls, including poster callbacks, must happen on the main thread.
++ */
++public final class AnalyzerSignalQueue {
++  public interface Poster {
++    /** Must enqueue, not run the task inline. Returns false if it cannot be posted. */
++    boolean post(Runnable task);
++  }
++
++  public interface Sink {
++    void onSignal(String fileName, String reference, boolean textChanged);
++  }
++
++  private final Poster poster;
++  private final Sink sink;
++  private String fileName;
++  private String reference;
++  private boolean textChanged;
++  private boolean scheduled;
++  private long generation;
++
++  public AnalyzerSignalQueue(Poster poster, Sink sink) {
++    if (poster == null || sink == null) throw new NullPointerException();
++    this.poster = poster;
++    this.sink = sink;
++  }
++
++  /** Returns false if the poster rejects the task. A later signal can retry. */
++  public boolean offer(String name, String ref, boolean changed) {
++    fileName = name;
++    reference = ref;
++    textChanged |= changed;
++    if (scheduled) return true;
++
++    scheduled = true;
++    final long token = ++generation;
++    final boolean posted;
++    try {
++      posted = poster.post(() -> deliver(token));
++    } catch (RuntimeException | Error failure) {
++      if (generation == token) scheduled = false;
++      throw failure;
++    }
++    if (!posted && generation == token) scheduled = false;
++    return posted;
++  }
++
++  /** Invalidates an already posted task, including if another signal arrives afterwards. */
++  public void cancel() {
++    generation++;
++    scheduled = false;
++    fileName = null;
++    reference = null;
++    textChanged = false;
++  }
++
++  private void deliver(long token) {
++    if (!scheduled || generation != token) return;
++    String name = fileName;
++    String ref = reference;
++    boolean changed = textChanged;
++    scheduled = false;
++    fileName = null;
++    reference = null;
++    textChanged = false;
++    sink.onSignal(name, ref, changed);
++  }
++}
+diff --git a/app/src/main/java/com/shima/demo/MainActivity.java b/app/src/main/java/com/shima/demo/MainActivity.java
+--- a/app/src/main/java/com/shima/demo/MainActivity.java
++++ b/app/src/main/java/com/shima/demo/MainActivity.java
+@@ -84,6 +84,34 @@
+   private String analyzerActiveName;
+   private String analyzerActiveReference;
+ 
++  // Diagnostics can be painted synchronously while the bridge is changing editors.
++  // Keep the latest real focus/edit and deliver it after the current UI stack unwinds.
++  private final android.os.Handler analyzerSignalHandler =
++      new android.os.Handler(android.os.Looper.getMainLooper());
++  private final almlk.AnalyzerSignalQueue analyzerSignals =
++      new almlk.AnalyzerSignalQueue(
++          task -> analyzerSignalHandler.post(task),
++          (fileName, reference, edited) -> {
++            if (!edited && analyzerBridge == null && (reference == null || reference.isEmpty()))
++              return;
++            almlk.AnalyzerBridge bridge = analyzerBridge();
++            if (edited) bridge.onEditorSignal(fileName, reference);
++            else bridge.focus(fileName, reference);
++            if (edited) bridge.requestProjectPass();
++          });
++
++  private void queueAnalyzerSignal(String fileName, String reference, boolean edited) {
++    if (!analyzerSignals.offer(fileName, reference, edited))
++      android.util.Log.w("ShimaAnalyzer", "Could not enqueue the editor signal");
++  }
++
++  private void clearAnalyzerSession() {
++    analyzerSignals.cancel();
++    analyzerActiveName = null;
++    analyzerActiveReference = null;
++    if (analyzerBridge != null) analyzerBridge.release();
++  }
++
+   /**
+    * ج٥٨: بَابُ الرَّسمِ يَعرِفُ صَاحِبَهُ. رَسمٌ يُنَادِيهِ رَسمٌ عَلى الخَيطِ نَفسِهِ
+    * مُجَمَّعٌ إِلَى نَظرَةٍ وَاحدَةٍ بَعۡدَ أن تَسۡتَقِرَّ الأُولَىٰ — فَالحَامِلُ قَدۡ يُنَادِي
+@@ -126,7 +154,7 @@
+   private void onAnalyzerFocus(String fileName, String reference) {
+     analyzerActiveName = fileName;
+     analyzerActiveReference = reference;
+-    analyzerBridge().onEditorSignal(fileName, reference);
++    queueAnalyzerSignal(fileName, reference, false);
+   }
+ 
+   @Override
+@@ -357,9 +385,7 @@
+       // قائمة التبويب: عند إغلاق كل التبويبات منها تُعرض الواجهة الفارغة كما في بقية المسارات.
+       editor.setTabsClosedListener(
+           () -> {
+-            if (analyzerBridge != null) analyzerBridge.release();
+-            analyzerActiveName = null;
+-            analyzerActiveReference = null;
++            clearAnalyzerSession();
+             empty.setVisibility(View.VISIBLE);
+             editor.setVisibility(View.GONE);
+             if (masterButton != null) masterButton.setVisibility(View.GONE);
+@@ -530,6 +556,7 @@
+     dependencyDiagnostics.clear();
+     shadowDiagnostics.clear();
+     moduleDiagnostics.clear();
++    clearAnalyzerSession();
+     publishProjectDiagnostics(true);
+     empty.setVisibility(View.VISIBLE);
+     editor.setVisibility(View.GONE);
+@@ -1289,10 +1316,15 @@
+     if (removed) publishProjectDiagnostics();
+     // ‏1.0.198: نَفسُ الإِشارَةِ تَذهَبُ لِلوَحدَةِ — تَرَدُّدُ المَكتَبَةِ (‏250ms‏) يُجَدوِلُها،
+     // وَالحَصرُ عِندَهَا: صِفْرُ فَحصٍ عَلَى خَيطِ الوَاجِهَةِ، وَلا قُفلَ عَلَى المُحرِّرِ.
+-    analyzerBridge().onEditorSignal(fileName, reference);
+-    // ج٤٨: الفَحصُ الجَمعِيُّ يُجَدوَلُ هُنَا أَيْضًا — المَمَرُّ نَفسُهُ يَرفُضُ التَّكرَارَ قَبلَ
+-    // أَربَعِ ثَوَانٍ، فَإِن كَثُرَتِ الإِشَارَاتُ اِنقَبَضَت عَلى قُفلٍ وَاحدٍ لَا عَلى طَابُورٍ.
+-    analyzerBridge().requestProjectPass();
++    // The focus signal carries the resolved reference; the edit callback can carry an
++    // empty session reference for that same tab. Keep the resolved identity if available.
++    String analyzerReference = reference;
++    if ((analyzerReference == null || analyzerReference.isEmpty())
++        && fileName != null && fileName.equals(analyzerActiveName))
++      analyzerReference = analyzerActiveReference;
++    // Coalesce edits with focus changes; the project pass starts after the bridge has
++    // adopted the newest editor, not against a previous tab's snapshot.
++    queueAnalyzerSignal(fileName, analyzerReference, true);
+   }
+ 
+   private void onEditorDiagnostics(
+diff --git a/qa/AnalyzerSignalQueueRegression.java b/qa/AnalyzerSignalQueueRegression.java
+new file mode 100644
+--- /dev/null
++++ b/qa/AnalyzerSignalQueueRegression.java
+@@ -0,0 +1,186 @@
++import almlk.AnalyzerBridge;
++import almlk.AnalyzerErrorUnit;
++import almlk.AnalyzerSignalQueue;
++import almlk.EditorFocusEdge;
++import com.almlkid.kay.ui.ProjectDiagnostic;
++import android.content.Context;
++import java.lang.reflect.Field;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.List;
++
++/** Host regression for the real app bridge and the main-thread signal queue. */
++public final class AnalyzerSignalQueueRegression {
++  private static int checks;
++
++  private static void check(boolean value, String message) {
++    checks++;
++    if (!value) throw new AssertionError(message);
++  }
++
++  private static final class QueuePoster implements AnalyzerSignalQueue.Poster {
++    final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
++    boolean rejectNext;
++    public boolean post(Runnable task) {
++      if (rejectNext) { rejectNext = false; return false; }
++      tasks.addLast(task);
++      return true;
++    }
++    void runOne() { tasks.removeFirst().run(); }
++    void drain() {
++      int count = 0;
++      while (!tasks.isEmpty()) {
++        if (++count > 128) throw new AssertionError("runaway editor-signal loop");
++        runOne();
++      }
++    }
++  }
++
++  private static void queueSemantics() {
++    QueuePoster poster = new QueuePoster();
++    List<String> delivered = new ArrayList<>();
++    AnalyzerSignalQueue q = new AnalyzerSignalQueue(poster,
++        (name, ref, changed) -> delivered.add(name + ":" + ref + ":" + changed));
++    check(q.offer("A", "/A.java", false), "first signal accepted");
++    q.offer("A", "/A.java", true);
++    q.offer("B", "/B.java", false);
++    check(poster.tasks.size() == 1, "signals share one queued task");
++    poster.drain();
++    check(delivered.size() == 1 && delivered.get(0).equals("B:/B.java:true"),
++        "latest focus and edit flag survive coalescing");
++
++    q.offer("stale", "/stale.java", true);
++    q.cancel();
++    q.offer("fresh", "/fresh.java", false);
++    check(poster.tasks.size() == 2, "a new task is scheduled after cancellation");
++    poster.runOne();
++    check(delivered.size() == 1, "a cancelled task cannot consume the new signal");
++    poster.drain();
++    check(delivered.size() == 2 && delivered.get(1).equals("fresh:/fresh.java:false"),
++        "the new signal survives a stale queued task");
++
++    poster.rejectNext = true;
++    check(!q.offer("rejected", "/r.java", true), "rejected post is reported");
++    check(q.offer("retry", "/retry.java", false), "a later signal retries posting");
++    poster.drain();
++    check(delivered.get(2).equals("retry:/retry.java:true"),
++        "an edit is retained across a rejected post");
++
++    final AnalyzerSignalQueue[] recursive = new AnalyzerSignalQueue[1];
++    final int[] depth = {0}, maxDepth = {0}, count = {0};
++    recursive[0] = new AnalyzerSignalQueue(poster, (name, ref, changed) -> {
++      depth[0]++;
++      maxDepth[0] = Math.max(maxDepth[0], depth[0]);
++      if (++count[0] == 1) recursive[0].offer("second", "/second.java", false);
++      depth[0]--;
++    });
++    recursive[0].offer("first", "/first.java", false);
++    poster.drain();
++    check(count[0] == 2 && maxDepth[0] == 1,
++        "a signal emitted during delivery is queued, not recursively dispatched");
++  }
++
++  private static Object field(Object target, String name) throws Exception {
++    Field f = target.getClass().getDeclaredField(name);
++    f.setAccessible(true);
++    return f.get(target);
++  }
++
++  private static boolean nativeAvailable() {
++    try {
++      Class.forName("com.shima.analyzer.core.NativeBridge", true,
++          AnalyzerSignalQueueRegression.class.getClassLoader());
++      return true;
++    } catch (ClassNotFoundException | LinkageError missing) {
++      return false;
++    }
++  }
++
++  private static void bridgeAndFocus(boolean haveNative) throws Exception {
++    AnalyzerErrorUnit.clearAll();
++    QueuePoster poster = new QueuePoster();
++    EditorFocusEdge edge = new EditorFocusEdge();
++    final AnalyzerBridge[] bridge = new AnalyzerBridge[1];
++    final String[] activeName = {null}, activeRef = {null}, deliveredRef = {null};
++    final boolean[] switchDuringPaint = {false};
++    final int[] publishes = {0}, deliveries = {0};
++
++    AnalyzerSignalQueue signals = new AnalyzerSignalQueue(poster, (name, ref, changed) -> {
++      deliveries[0]++;
++      deliveredRef[0] = ref;
++      if (changed) bridge[0].onEditorSignal(name, ref);
++      else bridge[0].focus(name, ref);
++      if (changed) bridge[0].requestProjectPass();
++    });
++    EditorFocusEdge.Sink focus = (name, ref) -> signals.offer(name, ref, false);
++    bridge[0] = new AnalyzerBridge(new Context(), ref ->
++        ref != null && ref.equals(activeRef[0]) ? "class Demo { int value; }" : null, () -> {
++          if (++publishes[0] > 32) throw new AssertionError("diagnostic/focus feedback loop");
++          if (switchDuringPaint[0]) {
++            switchDuringPaint[0] = false;
++            activeName[0] = "C.java";
++            activeRef[0] = "/p/C.java";
++          }
++          edge.announce(focus, activeName[0], activeRef[0]);
++        });
++
++    edge.announce(focus, null, null);
++    poster.drain();
++    for (int i = 0; i < 10000; i++) edge.announce(focus, null, null);
++    check(publishes[0] == 0 && deliveries[0] == 1 && poster.tasks.isEmpty(),
++        "repainting without a project does not recurse or republish");
++
++    activeName[0] = "A.java"; activeRef[0] = "/p/A.java";
++    edge.announce(focus, activeName[0], activeRef[0]);
++    poster.drain();
++    check(haveNative ? "/p/A.java".equals(field(bridge[0], "reference"))
++                     : bridge[0].status().startsWith("UNAVAILABLE_NATIVE"),
++        "first real focus is delivered");
++
++    activeName[0] = "B.java"; activeRef[0] = "/p/B.java";
++    switchDuringPaint[0] = true;
++    edge.announce(focus, activeName[0], activeRef[0]);
++    poster.drain();
++    check(!switchDuringPaint[0] && edge.isCurrent("C.java", "/p/C.java"),
++        "the publisher actually changed the focused editor during a transition");
++    check("/p/C.java".equals(deliveredRef[0]), "the nested focus is delivered after painting");
++    if (haveNative) {
++      check("/p/C.java".equals(field(bridge[0], "reference")),
++          "the bridge ends attached to C, not the obsolete B");
++      Object handle = field(bridge[0], "handle");
++      long before = ((Long) field(handle, "generation")).longValue();
++      signals.offer("C.java", "/p/C.java", true);
++      poster.drain();
++      long after = ((Long) field(handle, "generation")).longValue();
++      check(after > before, "text changes still invalidate analysis");
++    } else {
++      boolean found = false;
++      for (ProjectDiagnostic row : AnalyzerErrorUnit.rows())
++        if ("/p/C.java".equals(row.reference)) found = true;
++      check(found, "the final file still reports an unavailable native analyzer");
++      check("/p/C.java".equals(field(bridge[0], "reference")),
++          "unavailable diagnostics remain owned by the final file");
++    }
++    check(publishes[0] < 10, "diagnostic publishes remain bounded");
++
++    activeName[0] = "stale.java"; activeRef[0] = "/p/stale.java";
++    edge.announce(focus, activeName[0], activeRef[0]);
++    signals.cancel();
++    activeName[0] = null; activeRef[0] = null;
++    bridge[0].release();
++    poster.drain();
++    check(field(bridge[0], "reference") == null,
++        "a queued focus cannot reopen an editor after the session closes");
++    check(AnalyzerErrorUnit.rows().isEmpty(), "closing clears the last file's analyzer rows");
++    bridge[0].release();
++    AnalyzerErrorUnit.clearAll();
++  }
++
++  public static void main(String[] args) throws Exception {
++    boolean haveNative = nativeAvailable();
++    if (args.length > 0) check(haveNative == "native".equals(args[0]), "unexpected native test mode");
++    queueSemantics();
++    bridgeAndFocus(haveNative);
++    System.out.println("PASS: " + checks + " app bridge/queue checks (native=" + haveNative + ")");
++  }
++}
+diff --git a/qa.sh b/qa.sh
+--- a/qa.sh
++++ b/qa.sh
+@@ -54,6 +54,7 @@
+   "$SRC/almlk/AnalyzerWorkspacePlan.java" \
+   "$SRC/almlk/AnalyzerSymbolFeed.java" \
+   "$SRC/almlk/AnalyzerBridge.java" \
++  "$SRC/almlk/AnalyzerSignalQueue.java" \
+   "$SRC/almlk/EditorFocusEdge.java" \
+   $(find analyzer/src/main/java/com/shima/analyzer/core -name '*.java' -print) \
+   "$SRC/almlk/FileTypeIcons.java" \
+@@ -165,6 +166,7 @@
+   "$SRC/com/almlkid/kay/ui/CodeLanguageTools.java" \
+   "$SRC/net/margaritov/preference/colorpicker/HexColorCodec.java" \
+   qa/probes/almlk/ColorLiteralFactory.java \
++  qa/AnalyzerSignalQueueRegression.java \
+   qa/RegressionSuite.java
+ if [ $? -ne 0 ]; then echo "✘ فشلت الترجمة" >&2; exit 2; fi
+ 
+@@ -176,6 +178,10 @@
+ [ -f "$ANALYZER_NATIVE/libshima_analyzer.so" ] && LIBPATH="-Djava.library.path=$ANALYZER_NATIVE"
+ LANG=C.UTF-8 "$JAVA" -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -cp "$OUT" $LIBPATH RegressionSuite
+ CODE=$?
++if [ $CODE -eq 0 ]; then
++  LANG=C.UTF-8 "$JAVA" -Dfile.encoding=UTF-8 -cp "$OUT" $LIBPATH AnalyzerSignalQueueRegression
++  CODE=$?
++fi
+ 
+ rm -rf "$OUT"
+ if [ $CODE -eq 0 ]; then echo "### ✔ مجموعة الانحدار نجحت"; else echo "### ✘ مجموعة الانحدار فشلت" >&2; fi

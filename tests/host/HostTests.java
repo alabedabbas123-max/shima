@@ -523,6 +523,56 @@ public final class HostTests {
         Looper.pump(40); brokenHandle.close();
         check(errors.size()==1,"editor snapshot failures reach onError");
     }
+    private static void reentrantEditorClose() throws Exception {
+        final int[] unsubscribeCalls={0};
+        final int[] snapshotsRead={0};
+        final AnalysisHandle[] handle={null};
+        final List<AnalysisResult> results=new ArrayList<>();
+        final List<Throwable> errors=new ArrayList<>();
+        EditorAdapter adapter=new EditorAdapter() {
+            public String getText() { snapshotsRead[0]++; return "class X {}"; }
+            public void replace(int a,int b,String text) { }
+            public Subscription subscribe(final Runnable onChange) {
+                return new Subscription() {
+                    public void close() {
+                        if (++unsubscribeCalls[0]>1) throw new AssertionError("reentrant unsubscribe");
+                        // A host-provided unsubscribe can synchronously report another change
+                        // and reenter the session's close method.
+                        onChange.run();
+                        handle[0].close();
+                    }
+                };
+            }
+        };
+        handle[0]=CodeAnalyzer.with(new Context()).attachTo(adapter).sourceId("X.java").debounceMillis(0)
+                .onResult(new CodeAnalyzer.ResultListener() { public void onResult(AnalysisResult value) { results.add(value); } })
+                .onError(new CodeAnalyzer.ErrorListener() { public void onError(Throwable value) { errors.add(value); } }).start();
+        handle[0].close();
+        handle[0].close();
+        Looper.pump(100);
+        check(unsubscribeCalls[0]==1,"reentrant and repeated close unsubscribes once");
+        check(snapshotsRead[0]==0,"change during unsubscribe does not restart analysis");
+        check(results.isEmpty() && errors.isEmpty(),"closing cancels pending delivery and does not publish diagnostics");
+    }
+    private static void closeFromResultCallback() throws Exception {
+        final EditText editor=new EditText();
+        editor.getText().replace(0,0,"class X {}");
+        final AnalysisHandle[] handle={null};
+        final List<AnalysisResult> results=new ArrayList<>();
+        final List<Throwable> errors=new ArrayList<>();
+        handle[0]=CodeAnalyzer.with(new Context()).attachTo(editor).sourceId("X.java").debounceMillis(0)
+                .onResult(new CodeAnalyzer.ResultListener() { public void onResult(AnalysisResult value) {
+                    results.add(value);
+                    handle[0].close();
+                } })
+                .onError(new CodeAnalyzer.ErrorListener() { public void onError(Throwable value) { errors.add(value); } }).start();
+        waitForResults(results,1,5000);
+        check(results.size()==1 && errors.isEmpty(),"close from onResult completes without another callback");
+        check(editor.watcherCount()==0,"close from onResult detaches editor");
+        editor.getText().replace(0,0,"// changed\n");
+        Looper.pump(100);
+        check(results.size()==1 && errors.isEmpty(),"no delivery follows close from onResult");
+    }
     private static void workspaceEditorLifecycle() throws Exception {
         final EditText editor=new EditText(); editor.getText().replace(0,0,"class X { int x=R.id.key; }");
         final List<AnalysisResult> results=new ArrayList<>(); final List<Throwable> errors=new ArrayList<>();
@@ -576,7 +626,7 @@ public final class HostTests {
         handle.close();
     }
     public static void main(String[] args) throws Exception {
-        syntaxAndFixes(); androidCompatibility(); projectAndBudgets(); incrementalMatchesFresh(); incrementalUnicodeBoundaries(); workspaceResourcesAndXml(); workspaceJavaInspections(); dependencyResolution(); cancelAndClose(); editorLifecycle(); workspaceEditorLifecycle(); xmlWorkspaceEditorLifecycle(); latestEditorResultWins();
+        syntaxAndFixes(); androidCompatibility(); projectAndBudgets(); incrementalMatchesFresh(); incrementalUnicodeBoundaries(); workspaceResourcesAndXml(); workspaceJavaInspections(); dependencyResolution(); cancelAndClose(); editorLifecycle(); reentrantEditorClose(); closeFromResultCallback(); workspaceEditorLifecycle(); xmlWorkspaceEditorLifecycle(); latestEditorResultWins();
         System.out.println("PASS: " + checks + " host checks (real JNI parsers + editor test doubles)");
     }
 }
