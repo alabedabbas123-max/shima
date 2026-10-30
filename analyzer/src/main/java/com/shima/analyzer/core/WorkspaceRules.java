@@ -19,10 +19,22 @@ final class WorkspaceRules {
     private static final class DiagnosticList extends ArrayList<Diagnostic> {
         private static final long serialVersionUID=1L;
         private final int limit;
+        private final int[] severities=new int[3];
+        boolean resourceIncomplete;
         DiagnosticList(int limit) { this.limit=limit; }
-        @Override public boolean add(Diagnostic value) { return size()>limit ? false : super.add(value); }
+        @Override public boolean add(Diagnostic value) {
+            if ("RESOURCE_INDEX_INCOMPLETE".equals(value.getCode())) resourceIncomplete=true;
+            int severity=value.getSeverity().ordinal();
+            if (size()<=limit) { severities[severity]++; return super.add(value); } // one extra records truncation
+            int worst=severities[2]>0 ? 2 : severities[1]>0 ? 1 : 0;
+            if (severity>=worst) return false;
+            for (int i=size()-1;i>=0;i--) if (get(i).getSeverity().ordinal()==worst) {
+                set(i,value); severities[worst]--; severities[severity]++; return true;
+            }
+            return false;
+        }
     }
-    static Map<String,List<Diagnostic>> sourceRules(List<Analyzer.Parsed> parsed, ResourceIndex index, WorkspaceSnapshot snapshot, AnalysisConfig config, XmlAnalyzer.Stop stop) {
+    static Map<String,List<Diagnostic>> sourceRules(List<Analyzer.Parsed> parsed, ResourceIndex index, WorkspaceSnapshot snapshot, AnalysisConfig config, XmlAnalyzer.Stop stop, boolean projectIndexComplete) {
         LinkedHashMap<String,List<Diagnostic>> out=new LinkedHashMap<>();
         for (Analyzer.Parsed p : parsed) {
             if (stop.cancelled()) return out;
@@ -54,7 +66,7 @@ final class WorkspaceRules {
                 }
             }
         }
-        JavaWorkspaceRules.add(parsed, out, snapshot, stop);
+        JavaWorkspaceRules.add(parsed, out, snapshot, stop, projectIndexComplete);
         return out;
     }
     static Map<String,List<Diagnostic>> resourceRules(ResourceIndex index, WorkspaceSnapshot snapshot, AnalysisConfig config, XmlAnalyzer.Stop stop) {
@@ -120,10 +132,20 @@ final class WorkspaceRules {
     static AnalysisResult merge(SourceFile source, AnalysisResult base, List<Diagnostic> extras, int limit) {
         if (extras==null || extras.isEmpty()) return base;
         ArrayList<Diagnostic> all=new ArrayList<>(base.getDiagnostics());
-        boolean truncated=false;
-        for (Diagnostic extra : extras) {
-            if (all.size()>=limit) { truncated=true; break; }
-            all.add(extra);
+        all.addAll(extras);
+        boolean truncated=all.size()>limit;
+        if (truncated) {
+            // Preserve errors before less urgent warnings/info when a limit is reached;
+            // unused warnings must not crowd real errors out of a bounded result.
+            Collections.sort(all,new Comparator<Diagnostic>() {
+                @Override public int compare(Diagnostic a,Diagnostic b) {
+                    int severity=Integer.compare(a.getSeverity().ordinal(),b.getSeverity().ordinal());
+                    if (severity!=0) return severity;
+                    int position=Integer.compare(a.getRange().getStartOffset(),b.getRange().getStartOffset());
+                    return position!=0 ? position : a.getCode().compareTo(b.getCode());
+                }
+            });
+            all=new ArrayList<>(all.subList(0,limit));
         }
         Collections.sort(all,new Comparator<Diagnostic>() {
             @Override public int compare(Diagnostic a, Diagnostic b) {
@@ -131,9 +153,11 @@ final class WorkspaceRules {
                 return position!=0 ? position : a.getCode().compareTo(b.getCode());
             }
         });
-        boolean incomplete=truncated;
-        for (Diagnostic diagnostic : extras) if (diagnostic.getCode().equals("RESOURCE_INDEX_INCOMPLETE")) incomplete=true;
-        AnalysisResult.Status status=incomplete && base.getStatus()==AnalysisResult.Status.COMPLETE ? AnalysisResult.Status.PARTIAL : base.getStatus();
-        return new AnalysisResult(source,status,base.getParseMode(),all);
+        java.util.LinkedHashSet<String> reasons=new java.util.LinkedHashSet<>(base.getIncompleteReasons());
+        if (truncated) reasons.add("DIAGNOSTIC_LIMIT");
+        if (extras instanceof DiagnosticList && ((DiagnosticList) extras).resourceIncomplete) reasons.add("RESOURCE_INDEX_INCOMPLETE");
+        for (Diagnostic diagnostic : extras) if (diagnostic.getCode().equals("RESOURCE_INDEX_INCOMPLETE")) reasons.add("RESOURCE_INDEX_INCOMPLETE");
+        AnalysisResult.Status status=!reasons.isEmpty() && base.getStatus()==AnalysisResult.Status.COMPLETE ? AnalysisResult.Status.PARTIAL : base.getStatus();
+        return new AnalysisResult(source,status,base.getParseMode(),all,new ArrayList<>(reasons));
     }
 }

@@ -14,8 +14,7 @@ import android.view.View;
 import android.view.ViewTreeObserver;
 import android.widget.EditText;
 import com.shima.analyzer.core.Diagnostic;
-import java.util.ArrayList;
-import java.util.Collections;
+import com.shima.analyzer.core.DiagnosticTracker;
 import java.util.List;
 
 /** Optional visual layer for EditText. The host supplies diagnostics from the current editor snapshot. */
@@ -30,7 +29,10 @@ public final class EditTextSquiggles implements AutoCloseable {
         requireMain(); if (editor==null) throw new NullPointerException("editor"); this.editor=editor;
         watcher=new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s,int start,int count,int after) { }
-            @Override public void onTextChanged(CharSequence s,int start,int before,int count) { marks.items=Collections.emptyList(); marks.invalidateSelf(); }
+            @Override public void onTextChanged(CharSequence s,int start,int before,int count) {
+                marks.tracker.applyEdit(start,before,count,s.length());
+                marks.invalidateSelf();
+            }
             @Override public void afterTextChanged(Editable s) { }
         };
         layoutListener=new View.OnLayoutChangeListener() {
@@ -41,25 +43,26 @@ public final class EditTextSquiggles implements AutoCloseable {
         editor.getViewTreeObserver().addOnScrollChangedListener(scrollListener);
         bounds(); editor.getOverlay().add(marks);
     }
-    /** ERROR = red, WARNING = yellow, INFO is not painted. Clears automatically when text changes. */
+    /** ERROR = red, WARNING = yellow, INFO is not painted. Replace only with a current result. */
     public void setDiagnostics(List<Diagnostic> diagnostics) {
         requireMain(); if (closed) throw new IllegalStateException("Renderer is closed");
-        if (diagnostics==null) throw new NullPointerException("diagnostics");
-        marks.items=Collections.unmodifiableList(new ArrayList<>(diagnostics)); marks.invalidateSelf();
+        marks.tracker.setCurrent(diagnostics); marks.invalidateSelf();
     }
+    /** True after an edit until the host supplies a result for the latest snapshot. */
+    public boolean isPending() { requireMain(); return marks.tracker.isPending(); }
     private void bounds() { if (editor!=null) marks.setBounds(0,0,editor.getWidth(),editor.getHeight()); }
     @Override public void close() {
         requireMain(); if (closed) return; closed=true;
         editor.removeTextChangedListener(watcher); editor.removeOnLayoutChangeListener(layoutListener);
         ViewTreeObserver observer=editor.getViewTreeObserver(); if (observer.isAlive()) observer.removeOnScrollChangedListener(scrollListener);
-        editor.getOverlay().remove(marks); marks.items=Collections.emptyList(); editor=null;
+        editor.getOverlay().remove(marks); marks.tracker.setCurrent(java.util.Collections.<Diagnostic>emptyList()); editor=null;
     }
     private final class Marks extends Drawable {
-        List<Diagnostic> items=Collections.emptyList();
+        final DiagnosticTracker tracker=new DiagnosticTracker();
         final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
         final Path path=new Path();
         @Override public void draw(Canvas canvas) {
-            if (editor==null || items.isEmpty()) return;
+            if (editor==null || tracker.getMarks().isEmpty()) return;
             Layout layout=editor.getLayout(); if (layout==null) return;
             int length=editor.getText().length(); float density=editor.getResources().getDisplayMetrics().density;
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Math.max(1f,density));
@@ -71,13 +74,15 @@ public final class EditTextSquiggles implements AutoCloseable {
             int visibleLast=layout.getLineForVertical(editor.getScrollY()+Math.max(0,editor.getHeight()-editor.getExtendedPaddingTop()-editor.getExtendedPaddingBottom()));
             float visibleLeft=editor.getScrollX();
             float visibleRight=visibleLeft+Math.max(0,editor.getWidth()-editor.getCompoundPaddingLeft()-editor.getCompoundPaddingRight());
-            for (Diagnostic diagnostic : items) {
+            for (DiagnosticTracker.Mark mark : tracker.getMarks()) {
+                Diagnostic diagnostic=mark.getOriginal();
                 if (diagnostic.getSeverity()==Diagnostic.Severity.INFO) continue;
-                int start=Math.max(0,Math.min(length,diagnostic.getRange().getStartOffset()));
-                int end=Math.max(start,Math.min(length,diagnostic.getRange().getEndOffset()));
+                int start=Math.max(0,Math.min(length,mark.getStartOffset()));
+                int end=Math.max(start,Math.min(length,mark.getEndOffset()));
                 if (start==end && length>0) { if (start==length) start--; else end++; }
                 if (start==end) continue;
                 paint.setColor(diagnostic.getSeverity()==Diagnostic.Severity.ERROR ? Color.rgb(239,83,80) : Color.rgb(255,213,79));
+                paint.setAlpha(mark.isPending() ? 150 : 255);
                 int first=Math.max(visibleFirst,layout.getLineForOffset(start)), last=Math.min(visibleLast,layout.getLineForOffset(Math.max(start,end-1)));
                 for (int line=first;line<=last;line++) {
                     int from=Math.max(start,layout.getLineStart(line)), to=Math.min(end,layout.getLineVisibleEnd(line));

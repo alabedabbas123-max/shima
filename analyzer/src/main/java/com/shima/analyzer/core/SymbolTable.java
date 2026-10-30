@@ -24,9 +24,17 @@ final class SymbolTable {
     };
     private final Map<String, Set<String>> byName = new HashMap<>();
     private final Map<String, List<String>> ordered = new HashMap<>();
-    SymbolTable(List<String> additional) {
-        for (String name : BUILT_INS) add(name);
-        for (String name : additional) add(name);
+    SymbolTable(AnalysisConfig config) {
+        for (String name : BUILT_INS) {
+            if (name.startsWith("android.")) {
+                // A hard-coded platform name is not proof that it exists in the
+                // project's selected compile SDK. Unknown means no import hint.
+                ApiCatalog.Entry entry=ApiCatalog.type(config, name);
+                if (config.getCompileApi()==0 || entry==null || entry.since>config.getCompileApi()) continue;
+            }
+            add(name);
+        }
+        for (String name : config.getSymbols()) add(name);
     }
     void add(String qualified) {
         int dot = qualified.lastIndexOf('.');

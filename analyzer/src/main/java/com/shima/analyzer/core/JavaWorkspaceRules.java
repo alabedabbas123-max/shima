@@ -15,8 +15,8 @@ import java.util.regex.Pattern;
 
 /** Deliberately narrow Java-only structural checks; not a general type resolver. */
 final class JavaWorkspaceRules {
-    private static final int H=2, S=6, CLASS=11, EXTENDS=12, METHOD=13, PARAMETERS=14, PARAMETER=15, FIELD=16, LOCAL=17, CALL=18, ASSIGNED=19, OPAQUE=20;
-    private static final int PRIVATE=1, PUBLIC=2, STATIC=4, ABSTRACT=8, IMPLEMENTS=16;
+    private static final int H=2, S=6, CLASS=11, EXTENDS=12, METHOD=13, PARAMETERS=14, PARAMETER=15, FIELD=16, LOCAL=17, CALL=18, ASSIGNED=19, OPAQUE=20, MEMBER_ACCESS=21, LOCAL_SCOPE=22;
+    private static final int PRIVATE=1, PUBLIC=2, STATIC=4, ABSTRACT=8, IMPLEMENTS=16, DECL_ARRAY=32;
     private static final Set<String> OBJECT_METHODS=new HashSet<>(Arrays.asList("getClass","hashCode","equals","clone","toString","notify","notifyAll","wait","finalize"));
     private JavaWorkspaceRules() { }
     private static final class ClassInfo {
@@ -31,6 +31,8 @@ final class JavaWorkspaceRules {
         final ClassInfo owner; final String name; final int nameStart,nameEnd,start,end,flags;
         int parameterCount=-1; String returnType;
         final List<String> parameterTypes=new ArrayList<>();
+        final Map<String,String> parameterNames=new HashMap<>();
+        boolean parameterNamesIncomplete;
         MethodInfo(ClassInfo owner,String name,int ns,int ne,int start,int end,int flags) {
             this.owner=owner; this.name=name; nameStart=ns; nameEnd=ne; this.start=start; this.end=end; this.flags=flags;
         }
@@ -38,27 +40,33 @@ final class JavaWorkspaceRules {
     }
     private static final class VarInfo {
         final ClassInfo owner; final MethodInfo method; final String name,type; final int start,end,flags;
+        int scopeStart=-1, scopeEnd=-1;
         VarInfo(ClassInfo owner,MethodInfo method,String name,String type,int start,int end,int flags) {
             this.owner=owner; this.method=method; this.name=name; this.type=type; this.start=start; this.end=end; this.flags=flags;
         }
     }
     private static final class CallInfo {
-        final ClassInfo owner; final MethodInfo method; final String name; final int nameStart,nameEnd,start,end,flags;
+        final ClassInfo owner; final MethodInfo method; final String name; final int nameStart,nameEnd,start,flags;
         String expected;
-        CallInfo(ClassInfo owner,MethodInfo method,String name,int ns,int ne,int start,int end,int flags) {
-            this.owner=owner; this.method=method; this.name=name; nameStart=ns; nameEnd=ne; this.start=start; this.end=end; this.flags=flags;
+        CallInfo(ClassInfo owner,MethodInfo method,String name,int ns,int ne,int start,int flags) {
+            this.owner=owner; this.method=method; this.name=name; nameStart=ns; nameEnd=ne; this.start=start; this.flags=flags;
         }
     }
-    static void add(List<Analyzer.Parsed> parsed, Map<String,List<Diagnostic>> out, WorkspaceSnapshot snapshot, XmlAnalyzer.Stop stop) {
+    private static final class AccessInfo {
+        final ClassInfo owner; final MethodInfo method; final String name; final int nameStart,nameEnd,start;
+        AccessInfo(ClassInfo owner,MethodInfo method,String name,int nameStart,int nameEnd,int start) {
+            this.owner=owner; this.method=method; this.name=name; this.nameStart=nameStart; this.nameEnd=nameEnd; this.start=start;
+        }
+    }
+    static void add(List<Analyzer.Parsed> parsed, Map<String,List<Diagnostic>> out, WorkspaceSnapshot snapshot, XmlAnalyzer.Stop stop, boolean projectIndexComplete) {
         ArrayList<ClassInfo> classes=new ArrayList<>(); ArrayList<VarInfo> locals=new ArrayList<>(); ArrayList<CallInfo> calls=new ArrayList<>();
+        ArrayList<AccessInfo> accesses=new ArrayList<>();
         Map<String,Analyzer.Parsed> eligible=new HashMap<>();
         Map<Analyzer.Parsed,List<int[]>> opaqueScopes=new HashMap<>();
         Map<Analyzer.Parsed,List<ClassInfo>> classesByFile=new HashMap<>();
         for (Analyzer.Parsed p : parsed) {
             if (stop.cancelled()) return;
             if (p.source.getLanguage()!=Language.JAVA || p.status!=AnalysisResult.Status.COMPLETE || p.events==null || SemanticRules.hasSyntaxErrors(p)) continue;
-            // Java translates Unicode escapes before lexing; do not make guesses using raw-source identifiers.
-            if (p.source.getText().contains("\\u")) continue;
             eligible.put(p.source.getId(),p);
             opaqueScopes.put(p,opaqueRanges(p));
             String text=p.source.getText(); LineIndex lines=new LineIndex(text);
@@ -76,6 +84,7 @@ final class JavaWorkspaceRules {
             if (stop.cancelled()) return;
             String text=p.source.getText(); int[] e=p.events; List<ClassInfo> fileClasses=classesByFile.get(p);
             Map<Long,CallInfo> callsByRange=new HashMap<>();
+            Map<Integer,VarInfo> localsByOffset=new HashMap<>();
             for (int i=H;i+S<=e.length;i+=S) {
                 if (stop.cancelled()) return;
                 int kind=e[i], a=e[i+1], b=e[i+2], c=e[i+3], d=e[i+4], flags=e[i+5];
@@ -91,21 +100,31 @@ final class JavaWorkspaceRules {
             for (int i=H;i+S<=e.length;i+=S) {
                 if (stop.cancelled()) return;
                 int kind=e[i], a=e[i+1], b=e[i+2], c=e[i+3], d=e[i+4], flags=e[i+5];
-                if (kind!=PARAMETERS && kind!=PARAMETER && kind!=FIELD && kind!=LOCAL && kind!=CALL) continue;
+                if (kind!=PARAMETERS && kind!=PARAMETER && kind!=FIELD && kind!=LOCAL && kind!=CALL && kind!=MEMBER_ACCESS && kind!=LOCAL_SCOPE) continue;
                 if (!valid(text,a,b) || !valid(text,c,d) || opaque(opaqueScopes.get(p),a)) continue;
                 ClassInfo owner=owner(fileClasses,p,a); if (owner==null) continue;
                 MethodInfo method=method(owner,a);
                 if (kind==PARAMETERS && method!=null) {
                     method.parameterCount=flags; method.returnType=text.substring(c,d).trim();
                 } else if (kind==PARAMETER && method!=null) {
-                    method.parameterTypes.add(normalizeType(text.substring(a,b))+(flags!=0 ? "[]" : ""));
+                    String type=normalizeType(text.substring(a,b))+(flags!=0 ? "[]" : "");
+                    method.parameterTypes.add(type);
+                    Matcher param=Pattern.compile("([A-Za-z_$][A-Za-z0-9_$]*)\\s*(?:\\[\\s*\\]\\s*)*$").matcher(text.substring(c,d));
+                    if (param.find()) method.parameterNames.put(param.group(1),type);
+                    else method.parameterNamesIncomplete=true;
                 } else if (kind==FIELD) {
-                    owner.fields.add(new VarInfo(owner,null,text.substring(a,b),text.substring(c,d).trim(),a,b,flags));
+                    owner.fields.add(new VarInfo(owner,null,text.substring(a,b),text.substring(c,d).trim()+((flags&DECL_ARRAY)!=0 ? "[]" : ""),a,b,flags));
                 } else if (kind==LOCAL && method!=null) {
-                    locals.add(new VarInfo(owner,method,text.substring(a,b),text.substring(c,d).trim(),a,b,flags));
+                    VarInfo local=new VarInfo(owner,method,text.substring(a,b),text.substring(c,d).trim()+((flags&DECL_ARRAY)!=0 ? "[]" : ""),a,b,flags);
+                    locals.add(local); localsByOffset.put(a,local);
+                } else if (kind==LOCAL_SCOPE && method!=null) {
+                    VarInfo local=localsByOffset.get(a);
+                    if (local!=null) { local.scopeStart=c; local.scopeEnd=d; }
                 } else if (kind==CALL && method!=null) {
-                    CallInfo call=new CallInfo(owner,method,text.substring(a,b),a,b,c,d,flags);
+                    CallInfo call=new CallInfo(owner,method,text.substring(a,b),a,b,c,flags);
                     calls.add(call); callsByRange.put(rangeKey(c,d),call);
+                } else if (kind==MEMBER_ACCESS && method!=null) {
+                    accesses.add(new AccessInfo(owner,method,text.substring(a,b),a,b,c));
                 }
             }
             for (int i=H;i+S<=e.length;i+=S) if (e[i]==ASSIGNED) {
@@ -125,7 +144,11 @@ final class JavaWorkspaceRules {
             unused(cl,locals,out.get(cl.file.source.getId()),counts);
             checkBaseAdapter(cl,classes,out.get(cl.file.source.getId()),snapshot.isOverrideEnforced());
         }
-        missingCalls(calls,locals,classes,out,snapshot,stop);
+        // A batch/subset cannot prove that a receiver's declarations are absent elsewhere.
+        if (projectIndexComplete) {
+            missingCalls(calls,locals,classes,out,snapshot,stop);
+            missingFields(accesses,locals,classes,out,stop);
+        }
     }
     private static long rangeKey(int a,int b) { return ((long)a<<32) | (b&0xffffffffL); }
     private static boolean valid(String s,int a,int b) { return a>=0 && b>=a && b<=s.length(); }
@@ -325,45 +348,164 @@ final class JavaWorkspaceRules {
         return text.substring(start,i);
     }
     private static QuickFix fix(String title,SourceFile source,TextEdit edit) { return new QuickFix(title,source.getId(),QuickFix.fingerprint(source.getText()),Collections.singletonList(edit)); }
+    /** Resolves only uniquely named project source classes; external/ambiguous bases stay unknown. */
+    private static final class SourceTypes {
+        static final int PRESENT=1, ABSENT=0, UNKNOWN=-1;
+        final List<ClassInfo> classes;
+        final Map<String,List<ClassInfo>> byName=new HashMap<>();
+        final Map<MethodInfo,Map<String,List<VarInfo>>> localsByMethod=new HashMap<>();
+        SourceTypes(List<ClassInfo> classes,List<VarInfo> locals) {
+            this.classes=classes;
+            for (VarInfo local : locals) {
+                Map<String,List<VarInfo>> names=localsByMethod.get(local.method);
+                if (names==null) { names=new HashMap<>(); localsByMethod.put(local.method,names); }
+                List<VarInfo> declarations=names.get(local.name);
+                if (declarations==null) { declarations=new ArrayList<>(); names.put(local.name,declarations); }
+                declarations.add(local);
+            }
+            for (ClassInfo c : classes) {
+                List<ClassInfo> bucket=byName.get(c.name);
+                if (bucket==null) { bucket=new ArrayList<>(); byName.put(c.name,bucket); }
+                bucket.add(c);
+            }
+        }
+        ClassInfo type(String raw,ClassInfo from) {
+            if (raw==null || from==null) return null;
+            String name=raw.trim();
+            if (!name.matches("[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*")) return null;
+            int dot=name.lastIndexOf('.'); String simple=dot<0 ? name : name.substring(dot+1);
+            List<ClassInfo> candidates=byName.get(simple);
+            if (candidates==null) return null;
+            ClassInfo found=null;
+            for (ClassInfo candidate : candidates) {
+                // A same-file nested/local type may be out of scope or shadow an import.
+                // Resolve only top-level source types until declaration scopes are indexed.
+                if (isNested(candidate,classes)) continue;
+                if (dot>=0) {
+                    String pkg=packageName(candidate.file);
+                    if (pkg==null || !(pkg.isEmpty()?candidate.name:pkg+"."+candidate.name).equals(name)) continue;
+                }
+                if (!visibleFrom(candidate,from,classes)) continue;
+                if (found!=null && found!=candidate) return null;
+                found=candidate;
+            }
+            return found;
+        }
+        ClassInfo parent(ClassInfo child) {
+            if (child.superText==null) return null;
+            Matcher match=Pattern.compile("\\s*extends\\s+([A-Za-z_$][A-Za-z0-9_$.]*)\\s*").matcher(child.superText);
+            if (!match.matches()) return null;
+            return type(match.group(1),child);
+        }
+        boolean root(ClassInfo cl) {
+            // A source/imported class named Object can shadow java.lang.Object.
+            return cl.superText==null || cl.superText.matches("\\s*extends\\s+java\\.lang\\.Object\\s*");
+        }
+        int method(ClassInfo start,String name) {
+            Set<ClassInfo> seen=new HashSet<>(); ClassInfo cl=start;
+            while (cl!=null && seen.add(cl) && seen.size()<=128) {
+                for (MethodInfo method : cl.methods) if (method.name.equals(name)) return PRESENT;
+                // Unindexed interfaces may supply default methods; never infer their absence.
+                if ((cl.flags&IMPLEMENTS)!=0) return UNKNOWN;
+                if (root(cl)) return OBJECT_METHODS.contains(name) ? PRESENT : ABSENT;
+                cl=parent(cl);
+            }
+            return UNKNOWN;
+        }
+        int field(ClassInfo start,String name) {
+            Set<ClassInfo> seen=new HashSet<>(); ClassInfo cl=start;
+            while (cl!=null && seen.add(cl) && seen.size()<=128) {
+                for (VarInfo field : cl.fields) if (field.name.equals(name)) return PRESENT;
+                if ((cl.flags&IMPLEMENTS)!=0) return UNKNOWN;
+                if (root(cl)) return ABSENT;
+                cl=parent(cl);
+            }
+            return UNKNOWN;
+        }
+        VarInfo fieldDeclaration(ClassInfo start,String name) {
+            Set<ClassInfo> seen=new HashSet<>(); ClassInfo cl=start;
+            while (cl!=null && seen.add(cl) && seen.size()<=128) {
+                VarInfo found=null;
+                for (VarInfo field : cl.fields) if (field.name.equals(name)) {
+                    if (found!=null) return null;
+                    found=field;
+                }
+                if (found!=null) return found;
+                if ((cl.flags&IMPLEMENTS)!=0 || root(cl)) return null;
+                cl=parent(cl);
+            }
+            return null;
+        }
+        ClassInfo receiver(String expression,ClassInfo owner,MethodInfo method,int offset) {
+            String value=expression.replaceAll("\\s+","");
+            if (value.equals("this")) return owner;
+            if (value.equals("super")) return parent(owner);
+            boolean explicit=value.startsWith("this.");
+            String name=explicit ? value.substring(5) : value;
+            if (!name.matches("[A-Za-z_$][A-Za-z0-9_$]*")) return null;
+            if (!explicit) {
+                // A parameter/local shadows a field. Ambiguous scope is not an absence proof.
+                if (method.parameterNamesIncomplete || !method.knownSignature()) return null;
+                String parameter=method.parameterNames.get(name);
+                VarInfo local=null;
+                Map<String,List<VarInfo>> names=localsByMethod.get(method);
+                List<VarInfo> declarations=names==null ? null : names.get(name);
+                if (declarations!=null) for (VarInfo item : declarations) if (item.start<offset) {
+                    if (item.scopeStart<0) return null; // e.g. for-init without a safely recorded scope
+                    if (offset<item.scopeStart || offset>=item.scopeEnd) continue;
+                    if (local!=null) return null;
+                    local=item;
+                }
+                if (parameter!=null && local!=null) return null;
+                if (parameter!=null) return type(parameter,owner);
+                if (local!=null) return type(local.type,owner);
+            }
+            VarInfo field=fieldDeclaration(owner,name);
+            if (field==null || (field.owner!=owner && (field.flags&PRIVATE)!=0)) return null;
+            return type(field.type,owner);
+        }
+    }
+    private static String receiverText(String text,int start,int nameStart) {
+        if (start<0 || start>nameStart || nameStart>text.length()) return null;
+        String prefix=text.substring(start,nameStart).trim();
+        if (!prefix.endsWith(".")) return null;
+        return prefix.substring(0,prefix.length()-1).trim();
+    }
     private static void missingCalls(List<CallInfo> calls,List<VarInfo> locals,List<ClassInfo> classes,Map<String,List<Diagnostic>> out,WorkspaceSnapshot snapshot,XmlAnalyzer.Stop stop) {
+        SourceTypes types=new SourceTypes(classes,locals);
+        Map<ClassInfo,Map<String,Integer>> callCounts=new HashMap<>();
+        for (CallInfo call : calls) {
+            Map<String,Integer> names=callCounts.get(call.owner);
+            if (names==null) { names=new HashMap<>(); callCounts.put(call.owner,names); }
+            Integer previous=names.get(call.name);
+            names.put(call.name,previous==null ? 1 : previous+1);
+        }
         for (CallInfo call : calls) {
             if (stop.cancelled()) return;
-            if ((call.flags>>4)!=0) continue; // only no-argument calls
-            String text=call.owner.file.source.getText(), expression=text.substring(call.start,call.end), type=call.expected;
+            String text=call.owner.file.source.getText(), type=call.expected;
             if (type==null && (call.flags&2)!=0) type="void";
-            if (!safeReturnType(type)) continue;
-            boolean receiver=(call.flags&1)!=0; ClassInfo target=call.owner;
+            boolean receiver=(call.flags&1)!=0;
+            // Unqualified calls in a nested/local class can resolve to an enclosing instance.
+            if (!receiver && isNested(call.owner,classes)) continue;
+            ClassInfo target=call.owner;
             if (receiver) {
-                Matcher match=Pattern.compile("([A-Za-z_$][A-Za-z0-9_$]*)\\s*\\.\\s*"+Pattern.quote(call.name)+"\\s*\\(\\s*\\)").matcher(expression);
-                if (!match.matches()) continue;
-                String variable=match.group(1);
-                if (variable.equals("this")) receiver=false;
-                else {
-                    VarInfo resolved=null;
-                    for (VarInfo local : locals) if (local.method==call.method && local.name.equals(variable) && local.start<call.start) {
-                        if (resolved!=null) { resolved=null; break; } resolved=local;
-                    }
-                    if (resolved==null) continue;
-                    ClassInfo found=null;
-                    for (ClassInfo candidate : classes) if (candidate.name.equals(resolved.type)) {
-                        if (found!=null) { found=null; break; } found=candidate;
-                    }
-                    if (found==null || !visibleFrom(found,call.owner,classes)) continue;
-                    target=found;
-                }
+                String expression=receiverText(text,call.start,call.nameStart);
+                if (expression==null) continue;
+                target=types.receiver(expression,call.owner,call.method,call.start);
+                if (target==null) continue;
+                if (expression.replaceAll("\\s+","").equals("this")) receiver=false;
             }
-            if (target.superText!=null || (target.flags&IMPLEMENTS)!=0 || isNested(target,classes) || OBJECT_METHODS.contains(call.name) || hasStaticImport(call.owner.file)) continue;
-            if (type.equals("String")) {
-                boolean ambiguous=hasConflictingImport(call.owner.file,"String","java.lang.String") || hasConflictingImport(target.file,"String","java.lang.String");
-                for (ClassInfo candidate : classes) if (candidate.name.equals("String")) ambiguous=true;
-                if (ambiguous) continue;
-            }
-            boolean exists=false; for (MethodInfo method : target.methods) if (method.name.equals(call.name)) { exists=true; break; }
-            if (exists) continue;
-            int same=0; for (CallInfo other : calls) if (other.owner==call.owner && other.name.equals(call.name)) same++;
+            if (!receiver && hasStaticImport(call.owner.file)) continue;
+            if (types.method(target,call.name)!=SourceTypes.ABSENT) continue;
+            int same=callCounts.get(call.owner).get(call.name);
             List<QuickFix> fixes=Collections.emptyList();
             List<WorkspaceFix> workspaceFixes=Collections.emptyList();
-            if (same==1) {
+            boolean fixable=same==1 && (call.flags>>4)==0 && safeReturnType(type) && !isNested(target,classes);
+            if ("String".equals(type)) {
+                if (hasConflictingImport(call.owner.file,"String","java.lang.String") || hasConflictingImport(target.file,"String","java.lang.String")) fixable=false;
+                for (ClassInfo candidate : classes) if (candidate.name.equals("String")) fixable=false;
+            }
+            if (fixable) {
                 String newline=text.contains("\r\n")?"\r\n":"\n", targetText=target.file.source.getText();
                 String indent=indentAt(targetText,target.nameStart)+"    ";
                 String body=defaultReturn(type,target,call.name);
@@ -378,7 +520,19 @@ final class JavaWorkspaceRules {
                     workspaceFixes=Collections.singletonList(new WorkspaceFix("Create method "+call.name+" in "+target.name,guards,changes));
                 }
             }
-            add(out.get(call.owner.file.source.getId()),"UNRESOLVED_METHOD","No local no-argument method '"+call.name+"' was found in the supported scope.",Diagnostic.Severity.ERROR,call.owner.lines,call.nameStart,call.nameEnd,fixes,workspaceFixes);
+            add(out.get(call.owner.file.source.getId()),"UNRESOLVED_METHOD","Method '"+call.name+"' was not found in the known project class hierarchy.",Diagnostic.Severity.ERROR,call.owner.lines,call.nameStart,call.nameEnd,fixes,workspaceFixes);
+        }
+    }
+    private static void missingFields(List<AccessInfo> accesses,List<VarInfo> locals,List<ClassInfo> classes,Map<String,List<Diagnostic>> out,XmlAnalyzer.Stop stop) {
+        SourceTypes types=new SourceTypes(classes,locals);
+        for (AccessInfo access : accesses) {
+            if (stop.cancelled()) return;
+            String text=access.owner.file.source.getText();
+            String expression=receiverText(text,access.start,access.nameStart);
+            if (expression==null) continue;
+            ClassInfo target=types.receiver(expression,access.owner,access.method,access.start);
+            if (target==null || types.field(target,access.name)!=SourceTypes.ABSENT) continue;
+            add(out.get(access.owner.file.source.getId()),"UNRESOLVED_FIELD","Field '"+access.name+"' was not found in the known project class hierarchy.",Diagnostic.Severity.ERROR,access.owner.lines,access.nameStart,access.nameEnd,Collections.<QuickFix>emptyList(),Collections.<WorkspaceFix>emptyList());
         }
     }
     private static boolean visibleFrom(ClassInfo target,ClassInfo caller,List<ClassInfo> classes) {

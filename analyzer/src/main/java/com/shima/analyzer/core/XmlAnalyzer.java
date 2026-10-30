@@ -38,7 +38,12 @@ public final class XmlAnalyzer {
     static final class Parsed {
         final AnalysisResult result; final List<Tag> tags;
         Parsed(AnalysisResult result, List<Tag> tags) { this.result=result; this.tags=tags; }
-        boolean complete() { return result.getStatus() == AnalysisResult.Status.COMPLETE && result.getDiagnostics().isEmpty(); }
+        /** Tags are usable when XML parsed successfully, even if a later value rule reported an error. */
+        boolean complete() {
+            if (result.getStatus()!=AnalysisResult.Status.COMPLETE) return false;
+            for (Diagnostic d : result.getDiagnostics()) if (d.getCode().equals("XML_SYNTAX_ERROR")) return false;
+            return true;
+        }
     }
     private static final class Abort extends SAXException {
         private static final long serialVersionUID=1L;
@@ -108,7 +113,8 @@ public final class XmlAnalyzer {
             for (Tag tag : tags) for (Attribute attr : tag.attributes) {
                 if ((attr.name.equals("android:layout_width") || attr.name.equals("android:layout_height")) && !validDimension(attr.value)) {
                     if (diagnostics.size() >= config.getMaxDiagnostics())
-                        return new Parsed(new AnalysisResult(source, AnalysisResult.Status.PARTIAL, AnalysisResult.ParseMode.FULL, diagnostics), tags);
+                        return new Parsed(new AnalysisResult(source, AnalysisResult.Status.PARTIAL, AnalysisResult.ParseMode.FULL,
+                                diagnostics, Collections.singletonList("DIAGNOSTIC_LIMIT")), tags);
                     diagnostics.add(diagnostic("XML_INVALID_DIMENSION", "Invalid layout dimension: " + attr.value, Diagnostic.Severity.ERROR, text, attr.start, attr.end));
                 }
             }

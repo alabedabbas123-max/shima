@@ -76,7 +76,7 @@ public final class HostTests {
     private static void androidCompatibility() {
         String src="import android.app.NotificationChannel; import android.app.ProgressDialog; import android.os.Trace; " +
                 "class C { NotificationChannel c; ProgressDialog p; void f() { Trace.beginAsyncSection(\"x\", 1); } }";
-        try (Analyzer engine=new Analyzer()) {
+        try (Analyzer engine=new Analyzer(AnalysisConfig.builder().minApi(21).compileApi(35).build())) {
             AnalysisResult r=engine.analyze(javaFile("C.java",src));
             int api=0, deprecated=0;
             for (Diagnostic d : r.getDiagnostics()) { if(d.getCode().equals("ANDROID_API_LEVEL")) api++; if(d.getCode().equals("ANDROID_DEPRECATED")) deprecated++; }
@@ -89,6 +89,23 @@ public final class HostTests {
             String kotlinType="import android.app.NotificationChannel\nclass C { val channel: NotificationChannel? = null }";
             check(find(engine.analyze(kotlinFile("channel.kt",kotlinType)),"ANDROID_API_LEVEL")!=null, "Kotlin type API check");
         }
+        try (Analyzer engine=new Analyzer()) {
+            AnalysisResult unknown=engine.analyze(javaFile("unknown-levels.java",src));
+            check(find(unknown,"ANDROID_API_LEVEL")==null && find(unknown,"ANDROID_DEPRECATED")==null,
+                    "unknown project APIs do not invent device/default levels");
+            check(find(engine.analyze(javaFile("unknown-import.java","class C { NotificationChannel c; }")),"POSSIBLE_MISSING_IMPORT")==null,
+                    "unknown compile SDK does not suggest a hard-coded platform import");
+        }
+        try (Analyzer engine=new Analyzer(AnalysisConfig.builder().minApi(19).compileApi(25).build())) {
+            check(find(engine.analyze(javaFile("old-import.java","class C { NotificationChannel c; }")),"POSSIBLE_MISSING_IMPORT")==null,
+                    "do not suggest an Android class introduced after compileSdk");
+            check(find(engine.analyze(javaFile("old-api.java","import android.app.NotificationChannel; class C { NotificationChannel c; }")),"ANDROID_API_LEVEL")!=null,
+                    "project minSdk below the host app's minSdk is supported");
+        }
+        try (Analyzer engine=new Analyzer(AnalysisConfig.builder().compileApi(26).build())) {
+            check(find(engine.analyze(javaFile("new-import.java","class C { NotificationChannel c; }")),"POSSIBLE_MISSING_IMPORT")!=null,
+                    "a known compile SDK can suggest an available platform type");
+        }
         AnalysisConfig config=AnalysisConfig.builder().minApi(30).compileApi(35).build();
         try (Analyzer engine=new Analyzer(config)) {
             AnalysisResult r=engine.analyze(javaFile("C.java",src));
@@ -98,7 +115,7 @@ public final class HostTests {
         // The method name below is deliberately synthetic: parser rules do not verify a classpath.
         String extended="import android.window.SplashScreen; import android.os.Trace; " +
                 "class Extended { SplashScreen s; void f() { Trace.futureWork(); } }";
-        AnalysisConfig.Builder catalogBuilder=AnalysisConfig.builder()
+        AnalysisConfig.Builder catalogBuilder=AnalysisConfig.builder().minApi(21).compileApi(35)
                 .addAndroidApiType("android.window.SplashScreen",31,0)
                 .addAndroidApiStaticMethod("android.os.Trace","futureWork",33,35);
         AnalysisConfig extendedConfig=catalogBuilder.build();
@@ -117,7 +134,7 @@ public final class HostTests {
             check(importHint!=null && importHint.getQuickFixes().get(0).getTitle().contains("android.window.SplashScreen"),
                     "host platform types are also import candidates");
         }
-        try (Analyzer engine=new Analyzer(AnalysisConfig.builder().addAndroidApiType("android.app.ProgressDialog",1,0).build())) {
+        try (Analyzer engine=new Analyzer(AnalysisConfig.builder().compileApi(35).addAndroidApiType("android.app.ProgressDialog",1,0).build())) {
             check(find(engine.analyze(javaFile("override.java","import android.app.ProgressDialog; class C { ProgressDialog p; }")),"ANDROID_DEPRECATED")==null,
                     "explicit host metadata overrides built-in entries");
         }
@@ -160,6 +177,7 @@ public final class HostTests {
         try (Analyzer engine=new Analyzer(AnalysisConfig.builder().maxDiagnostics(1).build())) {
             AnalysisResult truncated=engine.analyze(javaFile("Limit.java", "class X { int x = \"bad\"; boolean y = 4; }"));
             check(truncated.getStatus()==AnalysisResult.Status.PARTIAL && truncated.getDiagnostics().size()==1, "diagnostic truncation is partial");
+            check(truncated.getIncompleteReasons().contains("DIAGNOSTIC_LIMIT"), "diagnostic truncation has its actual cause");
         }
         try (Analyzer engine=new Analyzer(AnalysisConfig.builder().addSymbol("other.Widget").build())) {
             String kotlin="class Box<out Widget>(val value: Widget)";
@@ -189,6 +207,11 @@ public final class HostTests {
         try (Analyzer engine=new Analyzer(limits)) {
             AnalysisResult large=engine.analyze(javaFile("large",new String(new char[1000]).replace('\0','\n')));
             check(large.getStatus()==AnalysisResult.Status.PARTIAL && find(large,"DOCUMENT_TOO_LARGE")!=null, "oversize is explicit, not clean");
+            String largeEscaped="class "+'\\'+"u0041 "+new String(new char[40]).replace('\0',' ');
+            AnalysisResult rejected=engine.analyze(javaFile("large-escaped",largeEscaped));
+            check(rejected.getIncompleteReasons().contains("DOCUMENT_TOO_LARGE")
+                    && !rejected.getIncompleteReasons().contains("JAVA_UNICODE_ESCAPES_UNSUPPORTED"),
+                    "document budget is checked before Unicode scanning");
             AnalysisResult capped=engine.analyze(javaFile("small","class A{List a;Map b;Set c;}"));
             check(capped.getStatus()==AnalysisResult.Status.PARTIAL && find(capped,"ANALYSIS_LIMIT")!=null, "event budget is explicit");
             try { engine.analyzeProject(Arrays.asList(javaFile("a",new String(new char[40])),javaFile("b",new String(new char[40])))); throw new AssertionError("project budget accepted"); }
@@ -271,6 +294,9 @@ public final class HostTests {
             AnalysisResult incompleteResult=engine.analyzeWorkspace(incomplete).getSources().get("Main.java");
             check(find(incompleteResult,"MISSING_RESOURCE")==null,"incomplete index never claims missing resource");
             check(incompleteResult.getStatus()==AnalysisResult.Status.PARTIAL && find(incompleteResult,"RESOURCE_INDEX_INCOMPLETE")!=null,"editor can see incomplete resource index");
+            check(incompleteResult.getIncompleteReasons().contains("RESOURCE_INDEX_INCOMPLETE")
+                    && !incompleteResult.getIncompleteReasons().contains("ANALYSIS_TIMEOUT"),
+                    "an incomplete resource index is not falsely reported as a timeout");
             String shadow="class C { Object R; int x=R.id.key; }";
             WorkspaceSnapshot shadowed=WorkspaceSnapshot.builder().resourceIndexComplete(true).addSource(javaFile("C.java",shadow)).build();
             check(find(engine.analyzeWorkspace(shadowed).getSources().get("C.java"),"MISSING_RESOURCE")==null,"local R shadow suppresses resource claims");
@@ -353,6 +379,104 @@ public final class HostTests {
             check(find(result,"MISSING_OVERRIDE_ANNOTATION").getSeverity()==Diagnostic.Severity.ERROR,"Override policy can be enforced");
         }
     }
+    private static void sourceMemberResolution() {
+        String parent="package demo; class Base { public String inherited(){return \"ok\";} public int count; }";
+        String helper="package demo; class ClipboardHelper extends Base { public String getKey(){return \"yes\";} }";
+        String editor="package demo; class Dictionary extends Base { ClipboardHelper clibs; "
+            +"private static final String TAG=\"perfectkeboard\"; private static final int CPS_BUFFER_SIZEE=16; "
+            +"public static boolean DEBUG=false, TRACE=false; static final boolean VOICE_INSTALLED=true, ENABLE_VOICE_BUTTON=true; "
+            +"void f(){ // this.clibs.fakeComment();\n"
+            +"String sql=\"CREATE TABLE ghost (getKay)\"; String text=\"this.clibs.fakeString()\"; "
+            +"String good=this.clibs.getKey(); String inherited=this.clibs.inherited(); "
+            +"int count=this.clibs.count; String s=this.clibs.getKay(); this.clibs.setKay(\"kay\"); "
+            +"int absent=this.clibs.noSuchField; this.inherited(); this.noSuchLocal(); } }";
+        try (Analyzer engine=new Analyzer()) {
+            WorkspaceSnapshot complete=WorkspaceSnapshot.builder().addSource(javaFile("Base.java",parent))
+                .addSource(javaFile("ClipboardHelper.java",helper)).addSource(javaFile("Dictionary.java",editor)).build();
+            AnalysisResult result=engine.analyzeWorkspace(complete).getSources().get("Dictionary.java");
+            check(hasAt(result,"UNRESOLVED_METHOD",editor.indexOf("getKay()")),"field receiver missing no-argument method detected");
+            check(hasAt(result,"UNRESOLVED_METHOD",editor.indexOf("setKay(\"kay\")")),"field receiver missing method with arguments detected");
+            check(hasAt(result,"UNRESOLVED_METHOD",editor.indexOf("noSuchLocal()")),"missing method on this with known superclass detected");
+            check(hasAt(result,"UNRESOLVED_FIELD",editor.indexOf("noSuchField")),"missing field on a known hierarchy detected");
+            check(!hasAt(result,"UNRESOLVED_METHOD",editor.indexOf("getKey()"))
+                && !hasAt(result,"UNRESOLVED_METHOD",editor.indexOf("inherited()"))
+                && !hasAt(result,"UNRESOLVED_FIELD",editor.indexOf(".count")+1),"existing and inherited members are not flagged");
+            for (Diagnostic d : result.getDiagnostics()) if (d.getSeverity()==Diagnostic.Severity.ERROR) {
+                int offset=d.getRange().getStartOffset();
+                check(offset!=editor.indexOf("TAG") && offset!=editor.indexOf("CPS_BUFFER_SIZEE")
+                    && offset!=editor.indexOf("DEBUG") && offset!=editor.indexOf("TRACE")
+                    && offset!=editor.indexOf("VOICE_INSTALLED") && offset!=editor.indexOf("ENABLE_VOICE_BUTTON"),
+                    "valid static constants/fields are not errors");
+                check(offset!=editor.indexOf("fakeComment") && offset!=editor.indexOf("fakeString")
+                    && offset!=editor.indexOf("CREATE TABLE"),"comments and string contents never become member diagnostics");
+            }
+            WorkspaceSnapshot incomplete=WorkspaceSnapshot.builder().projectIndexComplete(false)
+                .addSource(javaFile("ClipboardHelper.java",helper)).addSource(javaFile("Dictionary.java",editor)).build();
+            AnalysisResult partial=engine.analyzeWorkspace(incomplete).getSources().get("Dictionary.java");
+            check(!hasAt(partial,"UNRESOLVED_METHOD",editor.indexOf("getKay()"))
+                && partial.getIncompleteReasons().contains("PROJECT_INDEX_INCOMPLETE"),"incomplete project never claims a member is absent");
+            String external="package demo; class ClipboardHelper extends android.database.sqlite.SQLiteOpenHelper {}";
+            WorkspaceSnapshot unknown=WorkspaceSnapshot.builder().addSource(javaFile("ClipboardHelper.java",external))
+                .addSource(javaFile("Base.java",parent)).addSource(javaFile("Dictionary.java",editor)).build();
+            AnalysisResult uncertain=engine.analyzeWorkspace(unknown).getSources().get("Dictionary.java");
+            check(!hasAt(uncertain,"UNRESOLVED_METHOD",editor.indexOf("getKay()"))
+                && !hasAt(uncertain,"UNRESOLVED_FIELD",editor.indexOf("noSuchField")),"unknown Android superclass suppresses absence-based errors");
+            String shadows="class A { Missing value; void f(Local value){ value.exists(); this.value.call(); } } "
+                +"class Local { void exists(){} } class Missing { void call(){} }";
+            AnalysisResult shadow=engine.analyzeWorkspace(WorkspaceSnapshot.builder().addSource(javaFile("A.java",shadows)).build()).getSources().get("A.java");
+            check(find(shadow,"UNRESOLVED_METHOD")==null,"parameters shadow fields and this.field resolves separately");
+            String scoped="class Right { void exists(){} } class Wrong {} class Scope { Right x; void f(){ { Wrong x=null; } x.exists(); } }";
+            AnalysisResult scopeResult=engine.analyzeWorkspace(WorkspaceSnapshot.builder().addSource(javaFile("Scope.java",scoped)).build()).getSources().get("Scope.java");
+            check(find(scopeResult,"UNRESOLVED_METHOD")==null,"out-of-scope local does not shadow a field after its block ends");
+            String nested="class Outer { void present(){} class Inner { void f(){ present(); } } "
+                +"void g(){ class Local { void known(){} } Local x=null; x.known(); } }";
+            AnalysisResult nestedResult=engine.analyzeWorkspace(WorkspaceSnapshot.builder().addSource(javaFile("Outer.java",nested)).build()).getSources().get("Outer.java");
+            check(find(nestedResult,"UNRESOLVED_METHOD")==null,"nested/local types and outer-instance calls are not misresolved");
+            String objectShadow="class Object { void inherited(){} } class Child extends Object { void f(){ inherited(); } }";
+            AnalysisResult objectResult=engine.analyzeWorkspace(WorkspaceSnapshot.builder().addSource(javaFile("Child.java",objectShadow)).build()).getSources().get("Child.java");
+            check(find(objectResult,"UNRESOLVED_METHOD")==null,"a project class named Object is not mistaken for java.lang.Object");
+            String arrays="class Item {} class C { Item elements[]; void f(Item input[]){ int n=this.elements.length; int m=input.length; } }";
+            AnalysisResult arraysResult=engine.analyzeWorkspace(WorkspaceSnapshot.builder().addSource(javaFile("C.java",arrays)).build()).getSources().get("C.java");
+            check(find(arraysResult,"UNRESOLVED_FIELD")==null,"array declarator dimensions are not mistaken for scalar project objects");
+            String escaped="cl"+'\\'+"u0061ss Escaped {}";
+            WorkspaceSnapshot unicode=WorkspaceSnapshot.builder().addSource(javaFile("Base.java",parent))
+                .addSource(javaFile("ClipboardHelper.java",helper)).addSource(javaFile("Dictionary.java",editor))
+                .addSource(javaFile("Escaped.java",escaped)).build();
+            AnalysisResult unicodeResult=engine.analyzeWorkspace(unicode).getSources().get("Dictionary.java");
+            check(!hasAt(unicodeResult,"UNRESOLVED_METHOD",editor.indexOf("getKay()"))
+                && unicodeResult.getIncompleteReasons().contains("PROJECT_INDEX_INCOMPLETE"),
+                "an excluded Unicode-escaped source makes the project absence index visibly incomplete");
+            String escapedKeyword="cl"+'\\'+"u0061ss E {}";
+            AnalysisResult unicodeSingle=engine.analyze(javaFile("E.java",escapedKeyword));
+            check(unicodeSingle.getIncompleteReasons().contains("JAVA_UNICODE_ESCAPES_UNSUPPORTED")
+                && find(unicodeSingle,"SYNTAX_ERROR")==null && find(unicodeSingle,"MISSING_TOKEN")==null,
+                "translated Java Unicode escapes are not falsely diagnosed on the raw token stream");
+            String literalEscape="class Safe { char c='"+'\\'+"u0001'; }";
+            AnalysisResult safeEscape=engine.analyze(javaFile("Safe.java",literalEscape));
+            check(safeEscape.getStatus()==AnalysisResult.Status.COMPLETE
+                && find(safeEscape,"SYNTAX_ERROR")==null,"safe Unicode character escapes in literals do not disable project inspection");
+            String esc=""+'\\'+"u";
+            String safeSource="// "+esc+"0041\n/* "+esc+"0062 */ class Safe { String s=\""+esc+"0063\"; }";
+            AnalysisResult safeComments=engine.analyze(javaFile("SafeComments.java",safeSource));
+            check(safeComments.getStatus()==AnalysisResult.Status.COMPLETE && find(safeComments,"SYNTAX_ERROR")==null,
+                "ordinary Unicode escapes in comments and string contents do not suppress analysis");
+            String[] unsafe={"// "+esc+"000A class X {}", "/* "+esc+"002a/ class X {}",
+                "class X { String s=\""+esc+"0022; }", "class X { String s=\""+esc+"005c\"; }",
+                "class Na"+esc+"006de {}", "class X { String s=\"\"\"\n"+esc+"0022\"\"\"; }"};
+            for (int i=0;i<unsafe.length;i++) {
+                AnalysisResult u=engine.analyze(javaFile("Esc"+i+".java",unsafe[i]));
+                check(u.getStatus()==AnalysisResult.Status.PARTIAL
+                    && u.getIncompleteReasons().contains("JAVA_UNICODE_ESCAPES_UNSUPPORTED")
+                    && find(u,"SYNTAX_ERROR")==null && find(u,"MISSING_TOKEN")==null,
+                    "structurally unsafe Unicode escape "+i+" is partial without raw-parser syntax errors");
+            }
+        }
+    }
+    private static boolean hasAt(AnalysisResult result,String code,int offset) {
+        for (Diagnostic d : result.getDiagnostics()) if (d.getCode().equals(code) && d.getRange().getStartOffset()==offset) return true;
+        return false;
+    }
+
     private static void writeFixture(String relative,String text) throws Exception {
         String directory=System.getenv("SHIMA_FIXTURE_DIR");
         if (directory==null || directory.isEmpty()) return;
@@ -625,8 +749,195 @@ public final class HostTests {
             check(find(results.get(i), "INCOMPATIBLE_LITERAL")!=null && find(results.get(i), "POSSIBLE_MISSING_IMPORT")==null, "no stale result after edit");
         handle.close();
     }
+    private static byte[] classHeader(String internal, boolean isPublic) throws Exception {
+        ByteArrayOutputStream bytes=new ByteArrayOutputStream(); DataOutputStream out=new DataOutputStream(bytes);
+        out.writeInt(0xCAFEBABE); out.writeShort(0); out.writeShort(52); out.writeShort(5);
+        out.writeByte(1); out.writeUTF(internal); out.writeByte(7); out.writeShort(1);
+        out.writeByte(1); out.writeUTF("java/lang/Object"); out.writeByte(7); out.writeShort(3);
+        out.writeShort(isPublic ? 0x0021 : 0x0020); out.writeShort(2); out.writeShort(4);
+        out.writeShort(0); out.writeShort(0); out.writeShort(0); out.writeShort(0); out.flush();
+        return bytes.toByteArray();
+    }
+    private static byte[] jarFor(String name, boolean isPublic) throws Exception {
+        ByteArrayOutputStream bytes=new ByteArrayOutputStream();
+        try (java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(bytes)) {
+            zip.putNextEntry(new java.util.zip.ZipEntry(name+".class")); zip.write(classHeader(name,isPublic)); zip.closeEntry();
+        }
+        return bytes.toByteArray();
+    }
+    private static void dependencyVersionSymbols() throws Exception {
+        File dir=new File(System.getProperty("java.io.tmpdir"),"shima-version-"+System.nanoTime());
+        check(dir.mkdirs(),"temporary dependency test directory created");
+        File oldJar=new File(dir,"library-1.0.jar"), newJar=new File(dir,"library-2.0.jar"), aar=new File(dir,"library-2.0.aar"), bad=new File(dir,"bad.jar");
+        try {
+            try (FileOutputStream out=new FileOutputStream(oldJar)) { out.write(jarFor("example/lib/OldApi",true)); }
+            byte[] newer=jarFor("example/lib/NewApi",true);
+            try (FileOutputStream out=new FileOutputStream(newJar)) { out.write(newer); }
+            try (java.util.zip.ZipOutputStream out=new java.util.zip.ZipOutputStream(new FileOutputStream(aar))) {
+                out.putNextEntry(new java.util.zip.ZipEntry("classes.jar")); out.write(newer); out.closeEntry();
+            }
+            try (java.util.zip.ZipOutputStream out=new java.util.zip.ZipOutputStream(new FileOutputStream(bad))) {
+                out.putNextEntry(new java.util.zip.ZipEntry("example/lib/Fake.class")); out.write(new byte[]{1,2,3}); out.closeEntry();
+            }
+            ClasspathSymbols.Result old=ClasspathSymbols.scan(Collections.singletonList(oldJar));
+            ClasspathSymbols.Result updated=ClasspathSymbols.scan(Collections.singletonList(aar));
+            check(old.isComplete() && old.getSymbols().equals(Collections.singletonList("example.lib.OldApi")),"selected old JAR supplies only its public type");
+            check(updated.isComplete() && updated.getSymbols().equals(Collections.singletonList("example.lib.NewApi")),"selected new AAR supplies its own public type");
+            check(!ClasspathSymbols.scan(Collections.singletonList(bad)).isComplete(),"corrupt class headers are reported, not trusted");
+            check(!ClasspathSymbols.scan(Arrays.asList(aar,newJar)).isComplete(),"duplicate classes are explicitly reported");
+            AnalysisConfig.Builder oldConfig=AnalysisConfig.builder(), newConfig=AnalysisConfig.builder();
+            old.addTo(oldConfig); updated.addTo(newConfig);
+            String source="class Use { NewApi value; }";
+            try (Analyzer before=new Analyzer(oldConfig.build()); Analyzer after=new Analyzer(newConfig.build())) {
+                check(find(before.analyze(javaFile("Use.java",source)),"POSSIBLE_MISSING_IMPORT")==null,
+                        "an unavailable class from another library version is not suggested");
+                Diagnostic hint=find(after.analyze(javaFile("Use.java",source)),"POSSIBLE_MISSING_IMPORT");
+                check(hint!=null && hint.getQuickFixes().get(0).getTitle().contains("example.lib.NewApi"),
+                        "selected library version changes the available import candidate");
+            }
+        } finally {
+            oldJar.delete(); newJar.delete(); aar.delete(); bad.delete(); dir.delete();
+        }
+    }
+    private static void cancelWorkspaceAndReuse() throws Exception {
+        AnalysisConfig config=AnalysisConfig.builder().maxProjectFiles(400).maxProjectChars(20_000_000)
+                .maxEvents(100_000).timeoutMillis(30_000).build();
+        Analyzer analyzer=new Analyzer(config);
+        StringBuilder text=new StringBuilder("<resources>");
+        for (int i=0;i<4000;i++) text.append("<string name=\"x").append(i).append("\">v</string>");
+        text.append("</resources>");
+        WorkspaceSnapshot.Builder builder=WorkspaceSnapshot.builder().resourceIndexComplete(true);
+        for (int i=0;i<120;i++) builder.addResource(new ResourceFile("res/values/f"+i+".xml",text.toString()));
+        WorkspaceSnapshot large=builder.build();
+        AtomicReference<WorkspaceResult> result=new AtomicReference<>();
+        CountDownLatch entered=new CountDownLatch(1);
+        Thread worker=new Thread(() -> { entered.countDown(); result.set(analyzer.analyzeWorkspace(large)); });
+        worker.start(); entered.await(1,TimeUnit.SECONDS); Thread.sleep(15); analyzer.cancel(); worker.join(10_000);
+        check(!worker.isAlive() && result.get()!=null,"cancelling a workspace pass terminates cooperatively");
+        int cancelled=0; for (AnalysisResult r:result.get().getResources().values())
+            if (r.getStatus()==AnalysisResult.Status.CANCELLED) cancelled++;
+        check(cancelled==120,"cancelled workspace reports cancellation for every resource rather than publishing partial results");
+        WorkspaceSnapshot next=WorkspaceSnapshot.builder().resourceIndexComplete(true)
+                .addResource(new ResourceFile("res/values/strings.xml","<resources><string name=\"after\">ok</string></resources>"))
+                .build();
+        WorkspaceResult fresh=analyzer.analyzeWorkspace(next);
+        check(fresh.getResources().get("res/values/strings.xml").getStatus()==AnalysisResult.Status.COMPLETE
+                && fresh.isResourceIndexComplete(),"resource index remains reusable after cancellation");
+        analyzer.close();
+    }
+    private static void diagnosticStabilityAndXmlReuse() {
+        String original="class X { void f() { int x = 1 } }";
+        try (Analyzer analyzer=new Analyzer()) {
+            AnalysisResult initial=analyzer.analyze(javaFile("X.java",original));
+            Diagnostic error=find(initial,"MISSING_TOKEN");
+            check(error!=null,"syntax error exists before an unrelated edit");
+            DiagnosticTracker tracker=new DiagnosticTracker();
+            tracker.setCurrent(Collections.singletonList(error));
+            tracker.applyEdit(0,0,3,original.length()+3);
+            check(tracker.isPending() && tracker.getMarks().size()==1 && tracker.getMarks().get(0).isPending(),
+                    "unrelated edit preserves a visibly pending finding");
+            check(tracker.getMarks().get(0).getStartOffset()==error.getRange().getStartOffset()+3,
+                    "pending range shifts after an insertion before it");
+            String edited="//\n"+original;
+            AnalysisResult stillWrong=analyzer.analyze(javaFile("X.java",edited));
+            check(find(stillWrong,"MISSING_TOKEN")!=null,"unrelated edit did not actually fix the error");
+            tracker.setCurrent(stillWrong.getDiagnostics());
+            check(!tracker.isPending() && find(stillWrong,"MISSING_TOKEN")!=null,"fresh result replaces pending findings");
+            Diagnostic fresh=find(stillWrong,"MISSING_TOKEN");
+            String repaired=fresh.getQuickFixes().get(0).applyTo(edited);
+            tracker.applyEdit(fresh.getRange().getStartOffset(),0,1,repaired.length());
+            check(tracker.isPending() && !tracker.getMarks().isEmpty(),"editing the error also waits for reanalysis");
+            AnalysisResult fixed=analyzer.analyze(javaFile("X.java",repaired));
+            check(find(fixed,"MISSING_TOKEN")==null,"only a fresh analysis confirms the error was fixed");
+            tracker.setCurrent(fixed.getDiagnostics());
+            check(!tracker.isPending(),"current result ends the pending state");
+        }
+        String xml="<TextView xmlns:android=\"http://schemas.android.com/apk/res/android\" android:layout_width=\"wrap_content\" android:layout_height=\"wrap_content\" android:text=\"@string/title\"/>";
+        WorkspaceSnapshot.Builder builder=WorkspaceSnapshot.builder().resourceIndexComplete(false);
+        for (int i=0;i<70;i++) builder.addResource(new ResourceFile("res/layout/f"+i+".xml",xml));
+        WorkspaceSnapshot snapshot=builder.build();
+        try (Analyzer analyzer=new Analyzer()) {
+            WorkspaceResult first=analyzer.analyzeWorkspace(snapshot);
+            check(first.getParsedXmlCount()==70 && first.getReusedXmlCount()==0,"initial workspace parses all XML files");
+            int partial=0;
+            for (AnalysisResult r:first.getResources().values()) {
+                if (r.getStatus()==AnalysisResult.Status.PARTIAL) partial++;
+                check(r.getIncompleteReasons().equals(Collections.singletonList("RESOURCE_INDEX_INCOMPLETE")),
+                        "resource coverage is not reported as a parser timeout");
+            }
+            check(partial==70,"all XML resource-reference checks report incomplete coverage truthfully");
+            WorkspaceResult same=analyzer.analyzeWorkspace(snapshot);
+            check(same.getParsedXmlCount()==0 && same.getReusedXmlCount()==70,"unchanged resources reuse their index");
+            WorkspaceSnapshot changed=snapshot.withResource(new ResourceFile("res/layout/f13.xml",xml.replace("@string/title","@string/other")));
+            WorkspaceResult next=analyzer.analyzeWorkspace(changed);
+            check(next.getParsedXmlCount()==1 && next.getReusedXmlCount()==69,"one XML edit reparses only that XML document");
+            try (Analyzer freshAnalyzer=new Analyzer()) {
+                WorkspaceResult fresh=freshAnalyzer.analyzeWorkspace(changed);
+                for (String key:next.getResources().keySet())
+                    check(signature(next.getResources().get(key)).equals(signature(fresh.getResources().get(key))),
+                            "reused XML result matches fresh analysis for "+key);
+            }
+            WorkspaceSnapshot subset=WorkspaceSnapshot.builder().projectIndexComplete(false)
+                    .addSource(javaFile("Partial.java","class Partial { void f() { missing(); } }")).build();
+            AnalysisResult part=analyzer.analyzeWorkspace(subset).getSources().get("Partial.java");
+            check(part.getIncompleteReasons().contains("PROJECT_INDEX_INCOMPLETE") && find(part,"UNRESOLVED_METHOD")==null,
+                    "a source batch does not assert missing methods using an incomplete project index");
+            check(!subset.withSource(javaFile("Partial.java","class Partial {}" )).isProjectIndexComplete(),
+                    "replacing the live source retains the batch coverage flag");
+            WorkspaceSnapshot syntaxIncomplete=WorkspaceSnapshot.builder().projectIndexComplete(true)
+                    .addSource(javaFile("Broken.java","class Broken { void f( }"))
+                    .addSource(javaFile("Caller.java","class Caller { void f() { missing(); } }")).build();
+            AnalysisResult caller=analyzer.analyzeWorkspace(syntaxIncomplete).getSources().get("Caller.java");
+            check(caller.getIncompleteReasons().contains("PROJECT_INDEX_INCOMPLETE") && find(caller,"UNRESOLVED_METHOD")==null,
+                    "a different syntactically broken source also suppresses absence-based method claims");
+            WorkspaceSnapshot validIndex=WorkspaceSnapshot.builder().resourceIndexComplete(true)
+                    .addResource(new ResourceFile("res/layout/bad_dimension.xml",
+                            "<View xmlns:android=\"http://schemas.android.com/apk/res/android\" android:layout_width=\"banana\" android:layout_height=\"wrap_content\"/>"))
+                    .addResource(new ResourceFile("res/values/strings.xml","<resources><string name=\"title\">Hi</string></resources>"))
+                    .build();
+            WorkspaceResult dimension=analyzer.analyzeWorkspace(validIndex);
+            check(dimension.isResourceIndexComplete(),"a dimension finding does not invalidate otherwise valid resource declarations");
+            check(find(dimension.getResources().get("res/layout/bad_dimension.xml"),"XML_INVALID_DIMENSION")!=null,
+                    "the actual invalid dimension remains visible");
+            String layout="<TextView xmlns:android=\"http://schemas.android.com/apk/res/android\" android:layout_width=\"wrap_content\" android:layout_height=\"wrap_content\" android:text=\"@string/title\"/>";
+            WorkspaceSnapshot withValue=WorkspaceSnapshot.builder().resourceIndexComplete(true)
+                    .addResource(new ResourceFile("res/layout/main.xml",layout))
+                    .addResource(new ResourceFile("res/values/strings.xml","<resources><string name=\"title\">Hi</string></resources>"))
+                    .build();
+            check(find(analyzer.analyzeWorkspace(withValue).getResources().get("res/layout/main.xml"),"MISSING_RESOURCE")==null,
+                    "existing value resolves before deletion");
+            WorkspaceSnapshot removed=WorkspaceSnapshot.builder().resourceIndexComplete(true)
+                    .addResource(new ResourceFile("res/layout/main.xml",layout)).build();
+            WorkspaceResult afterRemoval=analyzer.analyzeWorkspace(removed);
+            check(afterRemoval.getParsedXmlCount()==0 && afterRemoval.getReusedXmlCount()==1
+                    && find(afterRemoval.getResources().get("res/layout/main.xml"),"MISSING_RESOURCE")!=null,
+                    "removing a resource drops its declarations while reusing unchanged XML");
+        }
+        StringBuilder pressure=new StringBuilder("class Pressure {");
+        for (int i=0;i<20;i++) pressure.append(" private int unused").append(i).append(";");
+        pressure.append(" void f() { missing(); } }");
+        try (Analyzer bounded=new Analyzer(AnalysisConfig.builder().maxDiagnostics(10).build())) {
+            WorkspaceSnapshot input=WorkspaceSnapshot.builder().addSource(javaFile("Pressure.java",pressure.toString())).build();
+            AnalysisResult result=bounded.analyzeWorkspace(input).getSources().get("Pressure.java");
+            check(result.getStatus()==AnalysisResult.Status.PARTIAL && result.getIncompleteReasons().contains("DIAGNOSTIC_LIMIT")
+                    && find(result,"UNRESOLVED_METHOD")!=null,
+                    "bounded workspace results prioritize a real error over a flood of unused warnings");
+            String manyWithResource=pressure.toString().replace("void f()", "int use = R.string.title; void f()");
+            WorkspaceSnapshot multiple=WorkspaceSnapshot.builder().resourceIndexComplete(false)
+                    .addSource(javaFile("Pressure.java",manyWithResource)).build();
+            AnalysisResult partial=bounded.analyzeWorkspace(multiple).getSources().get("Pressure.java");
+            check(partial.getIncompleteReasons().contains("DIAGNOSTIC_LIMIT")
+                    && partial.getIncompleteReasons().contains("RESOURCE_INDEX_INCOMPLETE"),
+                    "independent resource coverage and diagnostic-limit causes are both preserved");
+        }
+        AnalysisConfig a=AnalysisConfig.builder().minApi(23).compileApi(34).addAndroidApiType("android.example.Thing",23,0).build();
+        AnalysisConfig b=AnalysisConfig.builder().minApi(23).compileApi(34).addAndroidApiType("android.example.Thing",23,0).build();
+        AnalysisConfig c=AnalysisConfig.builder().minApi(23).compileApi(35).addAndroidApiType("android.example.Thing",23,0).build();
+        check(a.equals(b) && a.hashCode()==b.hashCode(),"equivalent configurations permit engine reuse");
+        check(!a.equals(c),"changing the project's compile SDK invalidates the analysis configuration");
+    }
     public static void main(String[] args) throws Exception {
-        syntaxAndFixes(); androidCompatibility(); projectAndBudgets(); incrementalMatchesFresh(); incrementalUnicodeBoundaries(); workspaceResourcesAndXml(); workspaceJavaInspections(); dependencyResolution(); cancelAndClose(); editorLifecycle(); reentrantEditorClose(); closeFromResultCallback(); workspaceEditorLifecycle(); xmlWorkspaceEditorLifecycle(); latestEditorResultWins();
+        syntaxAndFixes(); androidCompatibility(); projectAndBudgets(); incrementalMatchesFresh(); incrementalUnicodeBoundaries(); workspaceResourcesAndXml(); workspaceJavaInspections(); sourceMemberResolution(); dependencyResolution(); cancelAndClose(); editorLifecycle(); reentrantEditorClose(); closeFromResultCallback(); workspaceEditorLifecycle(); xmlWorkspaceEditorLifecycle(); latestEditorResultWins(); diagnosticStabilityAndXmlReuse(); dependencyVersionSymbols(); cancelWorkspaceAndReuse();
         System.out.println("PASS: " + checks + " host checks (real JNI parsers + editor test doubles)");
     }
 }

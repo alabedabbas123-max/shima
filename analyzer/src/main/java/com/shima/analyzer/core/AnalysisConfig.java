@@ -17,8 +17,12 @@ public final class AnalysisConfig {
     private final Map<String, ApiCatalog.Entry> androidTypes, androidStaticMethods;
 
     private AnalysisConfig(Builder b) {
-        if (b.minApi < 21) throw new IllegalArgumentException("minApi must be at least 21");
-        if (b.compileApi < b.minApi) throw new IllegalArgumentException("compileApi must be >= minApi");
+        // The analyzer's own Android minSdk is unrelated to the project being
+        // analyzed. Zero means the host could not determine that project level.
+        range("minApi", b.minApi, 0, 10_000);
+        range("compileApi", b.compileApi, 0, 10_000);
+        if (b.minApi > 0 && b.compileApi > 0 && b.compileApi < b.minApi)
+            throw new IllegalArgumentException("compileApi must be >= minApi when both are known");
         range("maxDocumentChars", b.maxDocumentChars, 1, 2_000_000);
         range("maxProjectChars", b.maxProjectChars, 1, 20_000_000);
         range("maxProjectFiles", b.maxProjectFiles, 1, 5000);
@@ -53,13 +57,32 @@ public final class AnalysisConfig {
     Map<String, ApiCatalog.Entry> androidTypes() { return androidTypes; }
     Map<String, ApiCatalog.Entry> androidStaticMethods() { return androidStaticMethods; }
 
+    /** Configurations are immutable value objects; useful when reusing a worker-owned Analyzer. */
+    @Override public boolean equals(Object other) {
+        if (this==other) return true;
+        if (!(other instanceof AnalysisConfig)) return false;
+        AnalysisConfig that=(AnalysisConfig) other;
+        return minApi==that.minApi && compileApi==that.compileApi
+                && maxDocumentChars==that.maxDocumentChars && maxProjectChars==that.maxProjectChars
+                && maxProjectFiles==that.maxProjectFiles && maxCachedFiles==that.maxCachedFiles
+                && maxDiagnostics==that.maxDiagnostics && maxEvents==that.maxEvents
+                && timeoutMillis==that.timeoutMillis && symbols.equals(that.symbols)
+                && androidTypes.equals(that.androidTypes) && androidStaticMethods.equals(that.androidStaticMethods);
+    }
+    @Override public int hashCode() {
+        return java.util.Objects.hash(minApi,compileApi,maxDocumentChars,maxProjectChars,maxProjectFiles,
+                maxCachedFiles,maxDiagnostics,maxEvents,timeoutMillis,symbols,androidTypes,androidStaticMethods);
+    }
+
     public static final class Builder {
-        private int minApi=21, compileApi=35, maxDocumentChars=200_000, maxProjectChars=2_000_000;
+        private int minApi=0, compileApi=0, maxDocumentChars=200_000, maxProjectChars=2_000_000;
         private int maxProjectFiles=500, maxCachedFiles=8, maxDiagnostics=100, maxEvents=12_000, timeoutMillis=1000;
         private final List<String> symbols = new ArrayList<>();
         private final Map<String, ApiCatalog.Entry> androidTypes = new HashMap<>();
         private final Map<String, ApiCatalog.Entry> androidStaticMethods = new HashMap<>();
+        /** Project minSdk, or 0 if unknown. This is not the host app's minSdk. */
         public Builder minApi(int value) { minApi=value; return this; }
+        /** Project compileSdk, or 0 if unknown. Never substitute the device API. */
         public Builder compileApi(int value) { compileApi=value; return this; }
         public Builder maxDocumentChars(int value) { maxDocumentChars=value; return this; }
         public Builder maxProjectChars(int value) { maxProjectChars=value; return this; }

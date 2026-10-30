@@ -9,6 +9,12 @@ final class ApiCatalog {
     static final class Entry {
         final int since, deprecated;
         Entry(int since, int deprecated) { this.since=since; this.deprecated=deprecated; }
+        @Override public boolean equals(Object other) {
+            if (!(other instanceof Entry)) return false;
+            Entry value=(Entry) other;
+            return since==value.since && deprecated==value.deprecated;
+        }
+        @Override public int hashCode() { return 31*since+deprecated; }
     }
     private static final Map<String, Entry> CLASSES, STATIC_METHODS;
     static {

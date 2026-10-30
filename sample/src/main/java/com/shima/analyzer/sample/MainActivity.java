@@ -29,6 +29,7 @@ import java.util.Map;
 public final class MainActivity extends Activity {
     private AnalysisHandle handle;
     private AnalysisResult latest;
+    private boolean pending;
     private EditText editor;
     private EditTextSquiggles squiggles;
     private final Map<String,String> resources=new LinkedHashMap<>();
@@ -66,13 +67,16 @@ public final class MainActivity extends Activity {
         squiggles=new EditTextSquiggles(editor);
         editor.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s,int start,int count,int after) { }
-            @Override public void onTextChanged(CharSequence s,int start,int before,int count) { latest=null; }
+            @Override public void onTextChanged(CharSequence s,int start,int before,int count) {
+                pending=true;
+                status.setText("Previous findings are pending reanalysis; fixes are disabled.");
+            }
             @Override public void afterTextChanged(Editable editable) { }
         });
         handle=CodeAnalyzer.with(this).attachTo(editor).sourceId("Main.java").language(Language.JAVA).workspace(workspace())
                 .onResult(new CodeAnalyzer.ResultListener() {
                     @Override public void onResult(AnalysisResult result) {
-                        latest=result; squiggles.setDiagnostics(result.getDiagnostics());
+                        latest=result; pending=false; squiggles.setDiagnostics(result.getDiagnostics());
                         int errors=0,warnings=0;
                         for (Diagnostic diagnostic : result.getDiagnostics()) {
                             if (diagnostic.getSeverity()==Diagnostic.Severity.ERROR) errors++;
@@ -87,13 +91,13 @@ public final class MainActivity extends Activity {
                 }).start();
         actions.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View view) {
-                if (latest!=null && !latest.getDiagnostics().isEmpty())
+                if (!pending && latest!=null && !latest.getDiagnostics().isEmpty())
                     DiagnosticActions.show(MainActivity.this,view,handle,latest.getDiagnostics().get(0),workspaceFixListener);
             }
         });
         editor.setOnTouchListener(new View.OnTouchListener() {
             @Override public boolean onTouch(View view,MotionEvent event) {
-                if (event.getAction()==MotionEvent.ACTION_UP && latest!=null)
+                if (event.getAction()==MotionEvent.ACTION_UP && !pending && latest!=null)
                     DiagnosticActions.showAt(MainActivity.this,editor,event.getX(),event.getY(),handle,latest.getDiagnostics(),workspaceFixListener);
                 return false; // Keep EditText's normal cursor and keyboard behaviour.
             }

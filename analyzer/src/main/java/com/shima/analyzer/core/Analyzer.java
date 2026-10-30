@@ -107,9 +107,10 @@ public final class Analyzer implements AutoCloseable {
         final int token=currentRevision();
         XmlAnalyzer.Stop stop=new XmlAnalyzer.Stop() { @Override public boolean cancelled() { return isCancelled(token); } };
         ResourceIndex resources;
-        if (sameResources(snapshot)) resources=cachedResourceIndex;
+        boolean reusedWholeIndex=sameResources(snapshot);
+        if (reusedWholeIndex) resources=cachedResourceIndex;
         else {
-            resources=new ResourceIndex(snapshot,config,stop);
+            resources=new ResourceIndex(snapshot,config,stop,cachedResourceIndex);
             if (!isCancelled(token)) {
                 cachedResources=new ArrayList<>(snapshot.getResources());
                 cachedResourcesComplete=snapshot.areResourcesComplete(); cachedResourceIndex=resources;
@@ -118,7 +119,7 @@ public final class Analyzer implements AutoCloseable {
         if (isCancelled(token)) return cancelledWorkspace(snapshot);
         ArrayList<Parsed> parsed=new ArrayList<>();
         SymbolTable symbols=newSymbols();
-        boolean completeIndex=true;
+        boolean completeIndex=snapshot.isProjectIndexComplete();
         for (SourceFile source : snapshot.getSources()) {
             if (isCancelled(token)) return cancelledWorkspace(snapshot);
             Parsed item=parse(source,token);
@@ -127,7 +128,7 @@ public final class Analyzer implements AutoCloseable {
             if (item.status!=AnalysisResult.Status.COMPLETE || SemanticRules.hasSyntaxErrors(item)) completeIndex=false;
             SemanticRules.addProjectDeclarations(item,symbols);
         }
-        Map<String,List<Diagnostic>> extra=WorkspaceRules.sourceRules(parsed,resources,snapshot,config,stop);
+        Map<String,List<Diagnostic>> extra=WorkspaceRules.sourceRules(parsed,resources,snapshot,config,stop,completeIndex);
         if (isCancelled(token)) return cancelledWorkspace(snapshot);
         Map<String,List<Diagnostic>> xmlExtra=WorkspaceRules.resourceRules(resources,snapshot,config,stop);
         if (isCancelled(token)) return cancelledWorkspace(snapshot);
@@ -141,10 +142,11 @@ public final class Analyzer implements AutoCloseable {
             SourceFile source=new SourceFile(entry.getKey(),Language.XML,resources.files.get(entry.getKey()).getText());
             xmlResults.put(entry.getKey(), WorkspaceRules.merge(source,entry.getValue().result,xmlExtra.get(entry.getKey()),config.getMaxDiagnostics()));
         }
-        return isCancelled(token) ? cancelledWorkspace(snapshot) : new WorkspaceResult(sourceResults,xmlResults,resources.complete);
+        return isCancelled(token) ? cancelledWorkspace(snapshot) : new WorkspaceResult(sourceResults,xmlResults,resources.complete,
+                reusedWholeIndex ? 0 : resources.parsedXml, reusedWholeIndex ? resources.xml.size() : resources.reusedXml);
     }
     private boolean sameResources(WorkspaceSnapshot snapshot) {
-        if (cachedResourceIndex==null || cachedResourcesComplete!=snapshot.areResourcesComplete() || cachedResources.size()!=snapshot.getResources().size()) return false;
+        if (cachedResourceIndex==null || !cachedResourceIndex.cacheReusable || cachedResourcesComplete!=snapshot.areResourcesComplete() || cachedResources.size()!=snapshot.getResources().size()) return false;
         for (int i=0;i<cachedResources.size();i++) {
             ResourceFile previous=cachedResources.get(i), current=snapshot.getResources().get(i);
             if (!previous.getPath().equals(current.getPath()) || !Objects.equals(previous.getText(),current.getText())) return false;
@@ -185,8 +187,10 @@ public final class Analyzer implements AutoCloseable {
     }
     private void ensureOpen() { if (closed) throw new IllegalStateException("Analyzer is closed"); }
     private SymbolTable newSymbols() {
-        SymbolTable symbols = new SymbolTable(config.getSymbols());
-        for (String type : config.androidTypes().keySet()) symbols.add(type);
+        SymbolTable symbols = new SymbolTable(config);
+        for (Map.Entry<String,ApiCatalog.Entry> type : config.androidTypes().entrySet()) {
+            if (config.getCompileApi()>0 && type.getValue().since<=config.getCompileApi()) symbols.add(type.getKey());
+        }
         return symbols;
     }
     private int currentRevision() { synchronized (cancelLock) { return revision; } }
@@ -195,6 +199,11 @@ public final class Analyzer implements AutoCloseable {
     private Parsed parse(SourceFile source, int token) {
         if (source.getText().length() > config.getMaxDocumentChars())
             return Parsed.unavailable(source, "DOCUMENT_TOO_LARGE", "Document exceeds the configured character budget.");
+        // Tree-sitter sees raw source, whereas javac translates Java Unicode escapes before
+        // tokenization. Avoid asserting syntax errors when that can change token boundaries.
+        if (source.getLanguage()==Language.JAVA && containsUnsafeJavaUnicodeEscape(source.getText()))
+            return Parsed.unavailable(source, "JAVA_UNICODE_ESCAPES_UNSUPPORTED",
+                    "Java Unicode escapes need preprocessing; syntax and member checks were skipped.");
         Document state = documents.get(source.getId());
         if (state != null && state.language != source.getLanguage()) {
             state.close(); documents.remove(source.getId()); state = null;
@@ -247,6 +256,60 @@ public final class Analyzer implements AutoCloseable {
         AnalysisResult.ParseMode mode = state.text == null ? AnalysisResult.ParseMode.FULL : AnalysisResult.ParseMode.INCREMENTAL;
         state.text=text; state.events=events; state.status=status; state.reasonCode=reasonCode; state.reason=reason;
         return new Parsed(source, events, status, mode, reasonCode, reason);
+    }
+
+    /**
+     * Escapes that can change Java token boundaries require preprocessing. Safe character escapes
+     * inside an ordinary literal/comment do not alter structural declarations, so do not make
+     * an entire project incomplete just because a string contains one.
+     */
+    private static boolean containsUnsafeJavaUnicodeEscape(String text) {
+        final int NORMAL=0, LINE=1, BLOCK=2, STRING=3, CHARACTER=4, TEXT_BLOCK=5;
+        int state=NORMAL;
+        for (int i=0;i<text.length();i++) {
+            char c=text.charAt(i), next=i+1<text.length() ? text.charAt(i+1) : 0;
+            if (c=='\\' && next=='u') {
+                int at=i+1;
+                while (at<text.length() && text.charAt(at)=='u') at++;
+                if (at+4<=text.length()) {
+                    int value=0; boolean valid=true;
+                    for (int j=0;j<4;j++) {
+                        int digit=Character.digit(text.charAt(at+j),16);
+                        if (digit<0) { valid=false; break; }
+                        value=(value<<4)|digit;
+                    }
+                    if (valid) {
+                        if (state==NORMAL || value=='\n' || value=='\r'
+                                || (state==BLOCK && (value=='*' || value=='/'))
+                                || ((state==STRING || state==CHARACTER || state==TEXT_BLOCK)
+                                    && (value=='\\' || value=='"' || value=='\''))) return true;
+                        i=at+3;
+                        continue;
+                    }
+                }
+            }
+            if (state==LINE) { if (c=='\n' || c=='\r') state=NORMAL; continue; }
+            if (state==BLOCK) { if (c=='*' && next=='/') { state=NORMAL; i++; } continue; }
+            if (state==STRING || state==CHARACTER) {
+                if (c=='\\') { if (i+1<text.length()) i++; continue; }
+                if ((state==STRING && c=='"') || (state==CHARACTER && c=='\'')) state=NORMAL;
+                continue;
+            }
+            if (state==TEXT_BLOCK) {
+                if (c=='\\') { if (i+1<text.length()) i++; continue; }
+                if (c=='"' && i+2<text.length() && text.charAt(i+1)=='"' && text.charAt(i+2)=='"') {
+                    state=NORMAL; i+=2;
+                }
+                continue;
+            }
+            if (c=='/' && next=='/') { state=LINE; i++; }
+            else if (c=='/' && next=='*') { state=BLOCK; i++; }
+            else if (c=='"' && i+2<text.length() && text.charAt(i+1)=='"' && text.charAt(i+2)=='"') {
+                state=TEXT_BLOCK; i+=2;
+            } else if (c=='"') state=STRING;
+            else if (c=='\'') state=CHARACTER;
+        }
+        return false;
     }
 
     private static AnalysisResult cancelled(SourceFile source) {

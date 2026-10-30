@@ -10,7 +10,7 @@ import java.util.Set;
 public final class WorkspaceSnapshot {
     private final List<SourceFile> sources;
     private final List<ResourceFile> resources;
-    private final boolean resourcesComplete, enforceOverride;
+    private final boolean resourcesComplete, projectIndexComplete, enforceOverride;
     private final String namespace, idsFile;
 
     private WorkspaceSnapshot(Builder b) {
@@ -27,7 +27,7 @@ public final class WorkspaceSnapshot {
             throw new IllegalArgumentException("Invalid Android namespace");
         sources=Collections.unmodifiableList(new ArrayList<>(b.sources));
         resources=Collections.unmodifiableList(new ArrayList<>(b.resources));
-        resourcesComplete=b.resourcesComplete; enforceOverride=b.enforceOverride;
+        resourcesComplete=b.resourcesComplete; projectIndexComplete=b.projectIndexComplete; enforceOverride=b.enforceOverride;
         namespace=b.namespace; idsFile=b.idsFile;
     }
     public static Builder builder() { return new Builder(); }
@@ -35,12 +35,14 @@ public final class WorkspaceSnapshot {
     public List<ResourceFile> getResources() { return resources; }
     /** The host explicitly asserts that project and dependency resources are all included. */
     public boolean areResourcesComplete() { return resourcesComplete; }
+    /** False for a subset/batch of the project's sources; absence-based checks are suppressed. */
+    public boolean isProjectIndexComplete() { return projectIndexComplete; }
     public boolean isOverrideEnforced() { return enforceOverride; }
     public String getNamespace() { return namespace; }
     public String getIdsFile() { return idsFile; }
     /** Replaces an editor snapshot while retaining the other files/resources. */
     public WorkspaceSnapshot withSource(SourceFile replacement) {
-        Builder b=builder().resourceIndexComplete(resourcesComplete).requireOverride(enforceOverride).idsFile(idsFile);
+        Builder b=builder().resourceIndexComplete(resourcesComplete).projectIndexComplete(projectIndexComplete).requireOverride(enforceOverride).idsFile(idsFile);
         if (namespace != null) b.namespace(namespace);
         boolean replaced=false;
         for (SourceFile source : sources) {
@@ -53,7 +55,7 @@ public final class WorkspaceSnapshot {
     }
     /** Replaces an XML editor snapshot while retaining the remaining workspace files. */
     public WorkspaceSnapshot withResource(ResourceFile replacement) {
-        Builder b=builder().resourceIndexComplete(resourcesComplete).requireOverride(enforceOverride).idsFile(idsFile);
+        Builder b=builder().resourceIndexComplete(resourcesComplete).projectIndexComplete(projectIndexComplete).requireOverride(enforceOverride).idsFile(idsFile);
         if (namespace != null) b.namespace(namespace);
         for (SourceFile source : sources) b.addSource(source);
         boolean replaced=false;
@@ -67,11 +69,12 @@ public final class WorkspaceSnapshot {
     public static final class Builder {
         private final List<SourceFile> sources=new ArrayList<>();
         private final List<ResourceFile> resources=new ArrayList<>();
-        private boolean resourcesComplete, enforceOverride;
+        private boolean resourcesComplete, projectIndexComplete=true, enforceOverride;
         private String namespace, idsFile="res/values/ids.xml";
         public Builder addSource(SourceFile source) { if (source == null) throw new NullPointerException("source"); sources.add(source); return this; }
         public Builder addResource(ResourceFile resource) { if (resource == null) throw new NullPointerException("resource"); resources.add(resource); return this; }
         public Builder resourceIndexComplete(boolean value) { resourcesComplete=value; return this; }
+        public Builder projectIndexComplete(boolean value) { projectIndexComplete=value; return this; }
         public Builder requireOverride(boolean value) { enforceOverride=value; return this; }
         public Builder namespace(String value) { namespace=value; return this; }
         public Builder idsFile(String value) { idsFile=value; return this; }

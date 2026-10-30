@@ -118,13 +118,17 @@ final class SemanticRules {
         });
         AnalysisResult.Status status = parsed.status;
         if (status == AnalysisResult.Status.COMPLETE && (!completeIndex || findings.truncated)) status=AnalysisResult.Status.PARTIAL;
-        return new AnalysisResult(source, status, parsed.mode, findings.items);
+        ArrayList<String> reasons=new ArrayList<>();
+        if (parsed.status==AnalysisResult.Status.PARTIAL) reasons.add(parsed.reasonCode==null ? "UNKNOWN" : parsed.reasonCode);
+        if (!completeIndex) reasons.add("PROJECT_INDEX_INCOMPLETE");
+        if (findings.truncated) reasons.add("DIAGNOSTIC_LIMIT");
+        return new AnalysisResult(source, status, parsed.mode, findings.items, reasons);
     }
 
     private static void apiFinding(Findings findings, ApiCatalog.Entry entry, String name, int start, int end, AnalysisConfig config) {
         if (entry == null) return;
-        if (entry.since > config.getMinApi()) findings.add("ANDROID_API_LEVEL", name + " requires API " + entry.since + "; verify a runtime guard for minSdk " + config.getMinApi() + ".", Diagnostic.Severity.WARNING, start, end, Collections.<QuickFix>emptyList());
-        if (entry.deprecated > 0 && entry.deprecated <= config.getCompileApi()) findings.add("ANDROID_DEPRECATED", name + " is deprecated since API " + entry.deprecated + ".", Diagnostic.Severity.WARNING, start, end, Collections.<QuickFix>emptyList());
+        if (config.getMinApi() > 0 && entry.since > config.getMinApi()) findings.add("ANDROID_API_LEVEL", name + " requires API " + entry.since + "; verify a runtime guard for minSdk " + config.getMinApi() + ".", Diagnostic.Severity.WARNING, start, end, Collections.<QuickFix>emptyList());
+        if (config.getCompileApi() > 0 && entry.deprecated > 0 && entry.deprecated <= config.getCompileApi()) findings.add("ANDROID_DEPRECATED", name + " is deprecated since API " + entry.deprecated + ".", Diagnostic.Severity.WARNING, start, end, Collections.<QuickFix>emptyList());
     }
 
     private static boolean incompatibleLiteral(Language language, String type, String value) {

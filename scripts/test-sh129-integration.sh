@@ -37,7 +37,7 @@ with zipfile.ZipFile(archive) as z:
         if path.is_absolute() or '..' in path.parts or stat.S_ISLNK(entry.external_attr >> 16):
             raise SystemExit('Unsafe archive entry: ' + entry.filename)
         name = entry.filename
-        allowed = name in ('qa.sh', 'analyzer/src/main/cpp/native_bridge.c') or (
+        allowed = name in ('qa.sh', 'qa/RegressionSuite.java', 'analyzer/build.gradle', 'analyzer/src/main/cpp/native_bridge.c') or (
             name.endswith('.java') and name.startswith((
                 'app/src/main/java/', 'analyzer/src/main/java/', 'qa/host-stubs/', 'qa/probes/'
             ))
@@ -53,7 +53,8 @@ with zipfile.ZipFile(archive) as z:
                     break
                 output.write(data)
 PY
-PATCH="$ROOT/integrations/sh129/focus-and-diagnostics.patch"
+# This cumulative patch starts from the unmodified sh129 archive and includes the prior focus fix.
+PATCH="$ROOT/integrations/sh129/quality-from-sh129.patch"
 git -C "$WORK/project" apply --check "$PATCH"
 git -C "$WORK/project" apply "$PATCH"
 P="$WORK/project"
@@ -81,7 +82,20 @@ mapfile -d '' -t APP_STUBS < <(find "$P/qa/host-stubs" -name '*.java' -print0)
 "$JAVA_BIN" -ea -Djava.library.path="$WORK/native" -cp "$WORK/classes" Sh129SyntaxCheck \
     "$P/app/src/main/java/com/shima/demo/MainActivity.java" \
     "$P/app/src/main/java/almlk/AnalyzerBridge.java" \
-    "$P/app/src/main/java/almlk/AnalyzerSignalQueue.java"
+    "$P/app/src/main/java/almlk/AnalyzerSignalQueue.java" \
+    "$P/app/src/main/java/almlk/AnalyzerWorkspacePlan.java" \
+    "$P/app/src/main/java/almlk/LiveDiagnostics.java" \
+    "$P/app/src/main/java/com/almlkid/kay/ui/AlmlkEditor.java" \
+    "$P/app/src/main/java/com/almlkid/kay/ui/CodeLanguageTools.java" \
+    "$P/app/src/main/java/almlk/JavaAttributor.java" \
+    "$P/app/src/main/java/almlk/JavaCodeAnalyzer.java" \
+    "$P/app/src/main/java/almlk/AnalyzerProtocol.java" \
+    "$P/app/src/main/java/almlk/AnalyzerErrorUnit.java" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerWire.java" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerConnection.java" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerService.java" \
+    "$P/app/src/main/java/com/almlkid/ui/DependencyCycle.java" \
+    "$P/app/src/main/java/com/almlkid/ui/SequentialPanelHost.java"
 # The app's host Handler runs post() inline. Substitute the SDK's queued main-loop
 # doubles for this separate worker-to-main dispatch regression.
 mapfile -d '' -t MAIN_STUBS < <(find "$P/qa/host-stubs" -name '*.java' \
@@ -91,5 +105,38 @@ mapfile -d '' -t MAIN_STUBS < <(find "$P/qa/host-stubs" -name '*.java' \
     "$ROOT/tests/host/stubs/android/os/Handler.java" \
     "$ROOT/tests/host/stubs/android/os/Looper.java" \
     "$P/app/src/main/java/almlk/AnalyzerBridge.java" \
-    "$ROOT/tests/integration/Sh129MainThreadDispatch.java"
+    "$ROOT/tests/integration/Sh129MainThreadDispatch.java" \
+    "$ROOT/tests/integration/Sh129QualityRegression.java"
 "$JAVA_BIN" -ea -Djava.library.path="$WORK/native" -cp "$WORK/main-classes" Sh129MainThreadDispatch
+"$JAVA_BIN" -ea -Djava.library.path="$WORK/native" -cp "$WORK/main-classes" Sh129QualityRegression
+
+# Compile the actual generation coordinator against controlled Android/resolver/dialog doubles.
+# This does not test real Gradle resolution or Android lifecycle behavior.
+mkdir -p "$WORK/dependency-classes"
+mapfile -d '' -t DEPENDENCY_STUBS < <(find "$ROOT/tests/integration/dependency-stubs" -name '*.java' -print0)
+"${COMPILER[@]}" -nowarn -encoding UTF-8 -proc:none \
+    -sourcepath "$ROOT/tests/integration/dependency-stubs" -d "$WORK/dependency-classes" \
+    "${DEPENDENCY_STUBS[@]}" \
+    "$ROOT/tests/host/stubs/android/os/Handler.java" \
+    "$ROOT/tests/host/stubs/android/os/Looper.java" \
+    "$P/app/src/main/java/com/almlkid/ui/DependencyCycle.java" \
+    "$ROOT/tests/integration/Sh129DependencyCycleRegression.java"
+"$JAVA_BIN" -ea -cp "$WORK/dependency-classes" Sh129DependencyCycleRegression
+
+# Exercise the real connection/service protocol with deterministic Android/Messenger doubles.
+# This is a JVM transport regression, not an instrumented Binder/device test.
+mkdir -p "$WORK/transport-classes"
+mapfile -d '' -t TRANSPORT_STUBS < <(find "$ROOT/tests/integration/transport-stubs" -name '*.java' -print0)
+"${COMPILER[@]}" -nowarn -encoding UTF-8 -proc:none \
+    -classpath "$WORK/main-classes" \
+    -sourcepath "$ROOT/tests/integration/transport-stubs:$P/qa/host-stubs:$P/app/src/main/java:$P/analyzer/src/main/java" \
+    -d "$WORK/transport-classes" \
+    "${TRANSPORT_STUBS[@]}" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerCarrier.java" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerWire.java" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerConnection.java" \
+    "$P/app/src/main/java/com/almlkid/analyzer/AnalyzerService.java" \
+    "$ROOT/tests/integration/Sh129TransportRegression.java" \
+    "$ROOT/tests/integration/Sh129LegacyRegression.java"
+"$JAVA_BIN" -ea -Djava.library.path="$WORK/native" -cp "$WORK/transport-classes:$WORK/main-classes" Sh129TransportRegression
+"$JAVA_BIN" -ea -Djava.library.path="$WORK/native" -cp "$WORK/transport-classes:$WORK/main-classes" Sh129LegacyRegression

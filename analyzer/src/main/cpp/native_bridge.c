@@ -16,8 +16,8 @@ enum { ERROR_NODE = 1, MISSING_NODE = 2, TYPE_REFERENCE = 3, PACKAGE_NODE = 4,
        LOCAL_TYPE_NAME = 9, RESOURCE_REFERENCE = 10, CLASS_STRUCTURE = 11,
        EXTENDS_STRUCTURE = 12, METHOD_STRUCTURE = 13, METHOD_PARAMETERS = 14,
        METHOD_PARAMETER = 15, FIELD_STRUCTURE = 16, LOCAL_STRUCTURE = 17,
-       METHOD_CALL = 18, ASSIGNED_CALL = 19, OPAQUE_CLASS_BODY = 20 };
-enum { MOD_PRIVATE = 1, MOD_PUBLIC = 2, MOD_STATIC = 4, MOD_ABSTRACT = 8, MOD_IMPLEMENTS = 16 };
+       METHOD_CALL = 18, ASSIGNED_CALL = 19, OPAQUE_CLASS_BODY = 20, MEMBER_ACCESS = 21, LOCAL_SCOPE = 22 };
+enum { MOD_PRIVATE = 1, MOD_PUBLIC = 2, MOD_STATIC = 4, MOD_ABSTRACT = 8, MOD_IMPLEMENTS = 16, MOD_DECL_ARRAY = 32 };
 enum { HEADER = 2, STRIDE = 6, MAX_VISITED_NODES = 250000 };
 
 typedef struct {
@@ -191,13 +191,20 @@ static void collect_structure(Events *events, TSNode node, int language) {
         } else if ((strcmp(type, "formal_parameter") == 0 || strcmp(type, "spread_parameter") == 0) && is_type(parent, "formal_parameters")) {
             TSNode parameter_type = field(node, "type"), name = field(node, "name");
             if (!ts_node_is_null(parameter_type) && !ts_node_is_null(name))
-                emit(events, METHOD_PARAMETER, parameter_type, node, strcmp(type, "spread_parameter") == 0);
+                emit(events, METHOD_PARAMETER, parameter_type, node,
+                     strcmp(type, "spread_parameter") == 0 || !ts_node_is_null(field(node, "dimensions")));
         } else if (strcmp(type, "variable_declarator") == 0 &&
                    (is_type(parent, "field_declaration") || is_type(parent, "local_variable_declaration"))) {
             TSNode name = field(node, "name"), variable_type = field(parent, "type"), value = field(node, "value");
             if (!ts_node_is_null(name) && !ts_node_is_null(variable_type)) {
+                int flags = modifier_flags(parent);
+                if (!ts_node_is_null(field(node, "dimensions"))) flags |= MOD_DECL_ARRAY;
                 emit(events, is_type(parent, "field_declaration") ? FIELD_STRUCTURE : LOCAL_STRUCTURE,
-                     name, variable_type, modifier_flags(parent));
+                     name, variable_type, flags);
+                if (is_type(parent, "local_variable_declaration")) {
+                    TSNode scope = ts_node_parent(parent);
+                    if (is_type(scope, "block")) emit(events, LOCAL_SCOPE, name, scope, 0);
+                }
                 if (is_type(value, "method_invocation")) emit(events, ASSIGNED_CALL, value, variable_type, 0);
             }
         } else if (strcmp(type, "method_invocation") == 0) {
@@ -209,8 +216,12 @@ static void collect_structure(Events *events, TSNode node, int language) {
                 emit(events, METHOD_CALL, name, node, flags);
             }
         }
-        if (strcmp(type, "field_access") == 0 && is_type(field(node, "object"), "field_access"))
-            emit(events, RESOURCE_REFERENCE, node, (TSNode) {0}, 0);
+        if (strcmp(type, "field_access") == 0) {
+            TSNode object = field(node, "object"), name = field(node, "field");
+            if (!ts_node_is_null(object) && !ts_node_is_null(name))
+                emit(events, MEMBER_ACCESS, name, node, 0);
+            if (is_type(object, "field_access")) emit(events, RESOURCE_REFERENCE, node, (TSNode) {0}, 0);
+        }
     } else if (strcmp(type, "navigation_expression") == 0 && ts_node_named_child_count(node) == 2 &&
                is_type(ts_node_named_child(node, 0), "navigation_expression")) {
         emit(events, RESOURCE_REFERENCE, node, (TSNode) {0}, 0);

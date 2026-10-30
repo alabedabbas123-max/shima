@@ -23,10 +23,13 @@ final class ResourceIndex {
     final Map<String,XmlAnalyzer.Parsed> xml=new LinkedHashMap<>();
     final Map<String,ResourceFile> files=new LinkedHashMap<>();
     boolean complete;
+    int parsedXml, reusedXml;
+    boolean cacheReusable=true;
 
-    ResourceIndex(WorkspaceSnapshot workspace, AnalysisConfig config, XmlAnalyzer.Stop stop) {
+    ResourceIndex(WorkspaceSnapshot workspace, AnalysisConfig config, XmlAnalyzer.Stop stop, ResourceIndex previous) {
         complete=workspace.areResourcesComplete();
         for (ResourceFile file : workspace.getResources()) {
+            if (stop.cancelled()) { complete=false; cacheReusable=false; break; }
             files.put(file.getPath(),file);
             Matcher match=FILE.matcher(file.getPath());
             if (!match.find()) { complete=false; continue; }
@@ -39,9 +42,19 @@ final class ResourceIndex {
             }
             if (!basename.toLowerCase(java.util.Locale.US).endsWith(".xml")) continue;
             if (file.getText()==null) { complete=false; continue; }
-            SourceFile source=new SourceFile(file.getPath(),Language.XML,file.getText());
-            XmlAnalyzer.Parsed parsed=XmlAnalyzer.inspect(source,config,stop);
+            ResourceFile old=previous==null ? null : previous.files.get(file.getPath());
+            XmlAnalyzer.Parsed parsed=previous==null ? null : previous.xml.get(file.getPath());
+            if (old!=null && java.util.Objects.equals(old.getText(),file.getText()) && parsed!=null
+                    && parsed.result.getStatus()==AnalysisResult.Status.COMPLETE) {
+                reusedXml++;
+            } else {
+                SourceFile source=new SourceFile(file.getPath(),Language.XML,file.getText());
+                parsed=XmlAnalyzer.inspect(source,config,stop);
+                parsedXml++;
+            }
             xml.put(file.getPath(),parsed);
+            // Timeouts and budget failures can be transient; do not cache them indefinitely.
+            if (parsed.result.getStatus()!=AnalysisResult.Status.COMPLETE) cacheReusable=false;
             if (!parsed.complete()) { complete=false; continue; }
             for (XmlAnalyzer.Tag tag : parsed.tags) {
                 for (XmlAnalyzer.Attribute attr : tag.attributes) {
